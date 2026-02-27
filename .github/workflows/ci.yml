@@ -1,0 +1,120 @@
+name: CI — Build & Test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install flake8
+      - run: flake8 dags/ data-generator/ --max-line-length=120 --ignore=E402,W503
+      - run: python -c "import yaml; yaml.safe_load(open('docker-compose.yml'))"
+        env:
+          # yaml.safe_load just needs the file to be valid YAML
+          PYTHONPATH: .
+
+  build:
+    name: Build Docker Image (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      matrix:
+        target: [airflow, generator]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ${{ matrix.target }} stage
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          target: ${{ matrix.target }}
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write .env from GitHub Secrets (or use defaults for CI)
+        run: |
+          cat > .env << 'EOF'
+          POSTGRES_HOST=postgres
+          POSTGRES_PORT=5432
+          POSTGRES_ADMIN_USER=admin
+          POSTGRES_ADMIN_PASSWORD=adminpass
+          AIRFLOW_DB=airflow
+          AIRFLOW_DB_USER=airflow
+          AIRFLOW_DB_PASSWORD=airflow
+          SALES_DB=salesdb
+          SALES_DB_USER=datauser
+          SALES_DB_PASSWORD=datapass
+          METABASE_DB=metabase
+          MINIO_HOST=minio
+          MINIO_API_PORT=9000
+          MINIO_CONSOLE_PORT=9001
+          MINIO_ROOT_USER=minio
+          MINIO_ROOT_PASSWORD=minio123
+          MINIO_SOURCE_BUCKET=sales-data
+          MINIO_ARCHIVE_BUCKET=processed-data
+          AIRFLOW_WEBSERVER_PORT=8080
+          AIRFLOW_ADMIN_USER=admin
+          AIRFLOW_ADMIN_PASSWORD=admin
+          AIRFLOW_ADMIN_EMAIL=admin@ci.local
+          AIRFLOW_FERNET_KEY=81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs=
+          AIRFLOW_SECRET_KEY=a25mQ1FHTUh3MnFRSk5KMEIyVVU2YmN0VGRyYTVXY2
+          METABASE_PORT=3000
+          EOF
+
+      - name: Start Postgres + MinIO
+        run: |
+          docker compose up -d postgres minio minio-init
+          timeout 60 bash -c 'until docker compose exec -T postgres pg_isready -U admin; do sleep 2; done'
+          timeout 60 bash -c 'until docker compose exec -T minio mc ready local 2>/dev/null; do sleep 2; done'
+
+      - name: Run data generator
+        run: docker compose run --rm data-generator
+
+      - name: Verify files in MinIO
+        run: |
+          COUNT=$(docker compose exec -T minio mc ls local/sales-data/raw/ | wc -l)
+          echo "Files in MinIO: $COUNT"
+          [ "$COUNT" -gt 0 ] || (echo "ERROR: No files uploaded" && exit 1)
+
+      - name: Start Airflow
+        run: |
+          docker compose up -d airflow-init
+          timeout 120 bash -c 'until docker compose logs airflow-init | grep -q "Airflow initialised"; do sleep 3; done'
+          docker compose up -d airflow-webserver airflow-scheduler
+          timeout 120 bash -c 'until curl -sf http://localhost:8080/health; do sleep 5; done'
+
+      - name: Trigger pipeline & wait
+        run: |
+          docker compose exec -T airflow-scheduler airflow dags trigger sales_pipeline
+          sleep 60
+
+      - name: Verify rows in PostgreSQL
+        run: |
+          ROWS=$(docker compose exec -T postgres psql -U datauser -d salesdb -t -c "SELECT COUNT(*) FROM fact_sales")
+          echo "Rows in fact_sales: $ROWS"
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v

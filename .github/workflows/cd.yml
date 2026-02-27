@@ -1,0 +1,86 @@
+name: CD — Deploy to Test Environment
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy & Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write .env from GitHub Secrets
+        run: |
+          cat > .env << EOF
+          POSTGRES_HOST=postgres
+          POSTGRES_PORT=5432
+          POSTGRES_ADMIN_USER=${{ secrets.POSTGRES_ADMIN_USER }}
+          POSTGRES_ADMIN_PASSWORD=${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+          AIRFLOW_DB=airflow
+          AIRFLOW_DB_USER=${{ secrets.AIRFLOW_DB_USER }}
+          AIRFLOW_DB_PASSWORD=${{ secrets.AIRFLOW_DB_PASSWORD }}
+          SALES_DB=salesdb
+          SALES_DB_USER=${{ secrets.SALES_DB_USER }}
+          SALES_DB_PASSWORD=${{ secrets.SALES_DB_PASSWORD }}
+          METABASE_DB=metabase
+          MINIO_HOST=minio
+          MINIO_API_PORT=9000
+          MINIO_CONSOLE_PORT=9001
+          MINIO_ROOT_USER=${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD=${{ secrets.MINIO_ROOT_PASSWORD }}
+          MINIO_SOURCE_BUCKET=sales-data
+          MINIO_ARCHIVE_BUCKET=processed-data
+          AIRFLOW_WEBSERVER_PORT=8080
+          AIRFLOW_ADMIN_USER=${{ secrets.AIRFLOW_ADMIN_USER }}
+          AIRFLOW_ADMIN_PASSWORD=${{ secrets.AIRFLOW_ADMIN_PASSWORD }}
+          AIRFLOW_ADMIN_EMAIL=${{ secrets.AIRFLOW_ADMIN_EMAIL }}
+          AIRFLOW_FERNET_KEY=${{ secrets.AIRFLOW_FERNET_KEY }}
+          AIRFLOW_SECRET_KEY=${{ secrets.AIRFLOW_SECRET_KEY }}
+          METABASE_PORT=3000
+          EOF
+
+      - name: Start full platform
+        run: |
+          docker compose up -d
+          timeout 90  bash -c 'until docker compose exec -T postgres pg_isready -U admin; do sleep 2; done'
+          timeout 90  bash -c 'until docker compose exec -T minio mc ready local 2>/dev/null; do sleep 2; done'
+          timeout 180 bash -c 'until curl -sf http://localhost:8080/health; do sleep 5; done'
+          echo "All services up ✓"
+
+      - name: Generate & upload sample data
+        run: docker compose run --rm data-generator
+
+      - name: Trigger sales pipeline
+        run: |
+          docker compose exec -T airflow-scheduler airflow dags trigger sales_pipeline
+          echo "Waiting 90s for pipeline …"
+          sleep 90
+
+      - name: Run data flow validation
+        run: |
+          docker compose exec -T airflow-scheduler airflow dags trigger data_flow_validation
+          sleep 30
+
+      - name: Print deployment report
+        run: |
+          SALES=$(docker compose exec -T postgres psql -U ${{ secrets.SALES_DB_USER }} -d salesdb -t -c "SELECT COUNT(*) FROM fact_sales")
+          CUSTOMERS=$(docker compose exec -T postgres psql -U ${{ secrets.SALES_DB_USER }} -d salesdb -t -c "SELECT COUNT(*) FROM dim_customers")
+          RUNS=$(docker compose exec -T postgres psql -U ${{ secrets.SALES_DB_USER }} -d salesdb -t -c "SELECT COUNT(*) FROM pipeline_runs WHERE status='success'")
+
+          echo "=================================="
+          echo "  DEPLOYMENT REPORT"
+          echo "=================================="
+          echo "  fact_sales rows   : $SALES"
+          echo "  dim_customers rows: $CUSTOMERS"
+          echo "  Successful runs   : $RUNS"
+          echo "=================================="
+          echo "  ✅ Deployment complete"
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v
