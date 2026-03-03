@@ -112,7 +112,7 @@ jobs:
 
       - name: Verify rows in PostgreSQL
         run: |
-          ROWS=$(docker compose exec -T postgres psql -U datauser -d salesdb -t -c "SELECT COUNT(*) FROM fact_sales")
+          ROWS=$(docker compose exec -T postgres psql -U admin -d salesdb -t -c "SELECT COUNT(*) FROM fact_sales")
           echo "Rows in fact_sales: $ROWS"
 
       - name: Cleanup
