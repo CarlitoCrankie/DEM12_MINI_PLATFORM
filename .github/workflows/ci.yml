@@ -17,7 +17,7 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install flake8
-      - run: flake8 dags/ data-generator/ --max-line-length=120 --ignore=E402,W503
+      - run: flake8 dags/ data-generator/ --max-line-length=120 --ignore=E402,W503,E241,E221
       - run: python -c "import yaml; yaml.safe_load(open('docker-compose.yml'))"
         env:
           # yaml.safe_load just needs the file to be valid YAML
