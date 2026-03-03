@@ -19,38 +19,82 @@ jobs:
           cat > .env << EOF
           POSTGRES_HOST=postgres
           POSTGRES_PORT=5432
-          POSTGRES_ADMIN_USER=${{ secrets.POSTGRES_ADMIN_USER }}
-          POSTGRES_ADMIN_PASSWORD=${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+          POSTGRES_ADMIN_USER=${{ secrets.POSTGRES_ADMIN_USER || 'admin' }}
+          POSTGRES_ADMIN_PASSWORD=${{ secrets.POSTGRES_ADMIN_PASSWORD || 'adminpass' }}
           AIRFLOW_DB=airflow
-          AIRFLOW_DB_USER=${{ secrets.AIRFLOW_DB_USER }}
-          AIRFLOW_DB_PASSWORD=${{ secrets.AIRFLOW_DB_PASSWORD }}
+          AIRFLOW_DB_USER=${{ secrets.AIRFLOW_DB_USER || 'airflow' }}
+          AIRFLOW_DB_PASSWORD=${{ secrets.AIRFLOW_DB_PASSWORD || 'airflow' }}
           SALES_DB=salesdb
-          SALES_DB_USER=${{ secrets.SALES_DB_USER }}
-          SALES_DB_PASSWORD=${{ secrets.SALES_DB_PASSWORD }}
+          SALES_DB_USER=${{ secrets.SALES_DB_USER || 'datauser' }}
+          SALES_DB_PASSWORD=${{ secrets.SALES_DB_PASSWORD || 'datapass' }}
           METABASE_DB=metabase
           MINIO_HOST=minio
           MINIO_API_PORT=9000
           MINIO_CONSOLE_PORT=9001
-          MINIO_ROOT_USER=${{ secrets.MINIO_ROOT_USER }}
-          MINIO_ROOT_PASSWORD=${{ secrets.MINIO_ROOT_PASSWORD }}
+          MINIO_ROOT_USER=${{ secrets.MINIO_ROOT_USER || 'minio' }}
+          MINIO_ROOT_PASSWORD=${{ secrets.MINIO_ROOT_PASSWORD || 'minio123' }}
           MINIO_SOURCE_BUCKET=sales-data
           MINIO_ARCHIVE_BUCKET=processed-data
           AIRFLOW_WEBSERVER_PORT=8080
-          AIRFLOW_ADMIN_USER=${{ secrets.AIRFLOW_ADMIN_USER }}
-          AIRFLOW_ADMIN_PASSWORD=${{ secrets.AIRFLOW_ADMIN_PASSWORD }}
-          AIRFLOW_ADMIN_EMAIL=${{ secrets.AIRFLOW_ADMIN_EMAIL }}
-          AIRFLOW_FERNET_KEY=${{ secrets.AIRFLOW_FERNET_KEY }}
-          AIRFLOW_SECRET_KEY=${{ secrets.AIRFLOW_SECRET_KEY }}
+          AIRFLOW_ADMIN_USER=${{ secrets.AIRFLOW_ADMIN_USER || 'admin' }}
+          AIRFLOW_ADMIN_PASSWORD=${{ secrets.AIRFLOW_ADMIN_PASSWORD || 'admin' }}
+          AIRFLOW_ADMIN_EMAIL=${{ secrets.AIRFLOW_ADMIN_EMAIL || 'admin@ci.local' }}
+          AIRFLOW_FERNET_KEY=${{ secrets.AIRFLOW_FERNET_KEY || '81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs=' }}
+          AIRFLOW_SECRET_KEY=${{ secrets.AIRFLOW_SECRET_KEY || 'a25mQ1FHTUh3MnFRSk5KMEIyVVU2YmN0VGRyYTVXY2' }}
           METABASE_PORT=3000
           EOF
+          echo ".env written successfully"
 
-      - name: Start full platform
+      - name: Start PostgreSQL and MinIO first
         run: |
-          docker compose up -d
-          timeout 90  bash -c 'until docker compose exec -T postgres pg_isready -U admin; do sleep 2; done'
-          timeout 90  bash -c 'until docker compose exec -T minio mc ready local 2>/dev/null; do sleep 2; done'
-          timeout 180 bash -c 'until curl -sf http://localhost:8080/health; do sleep 5; done'
-          echo "All services up ✓"
+          docker compose up -d postgres minio
+          echo "Waiting for PostgreSQL to be healthy ..."
+          timeout 120 bash -c '
+            until docker inspect mdp-postgres --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do
+              echo "  postgres: $(docker inspect mdp-postgres --format={{.State.Health.Status}} 2>/dev/null || echo starting)"
+              sleep 5
+            done
+          '
+          echo "PostgreSQL is healthy"
+          echo "Waiting for MinIO to be healthy ..."
+          timeout 60 bash -c '
+            until docker inspect mdp-minio --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do
+              echo "  minio: $(docker inspect mdp-minio --format={{.State.Health.Status}} 2>/dev/null || echo starting)"
+              sleep 5
+            done
+          '
+          echo "MinIO is healthy"
+
+      - name: Initialise MinIO buckets
+        run: |
+          docker compose up -d minio-init
+          timeout 30 bash -c '
+            until docker inspect mdp-minio-init --format="{{.State.Status}}" 2>/dev/null | grep -q "exited"; do
+              sleep 2
+            done
+          '
+          echo "MinIO buckets ready"
+
+      - name: Start Airflow
+        run: |
+          docker compose up -d airflow-init
+          echo "Waiting for Airflow to initialise ..."
+          timeout 180 bash -c '
+            until docker compose logs airflow-init 2>/dev/null | grep -q "Airflow initialised"; do
+              echo "  waiting for airflow-init ..."
+              sleep 5
+            done
+          '
+          echo "Airflow init complete"
+          docker compose up -d airflow-webserver airflow-scheduler
+          echo "Waiting for Airflow webserver ..."
+          timeout 120 bash -c '
+            until curl -sf http://localhost:8080/health 2>/dev/null | grep -q "healthy"; do
+              echo "  waiting for airflow webserver ..."
+              sleep 5
+            done
+          '
+          echo "Airflow webserver ready"
 
       - name: Generate & upload sample data
         run: docker compose run --rm data-generator
@@ -58,7 +102,7 @@ jobs:
       - name: Trigger sales pipeline
         run: |
           docker compose exec -T airflow-scheduler airflow dags trigger sales_pipeline
-          echo "Waiting 90s for pipeline …"
+          echo "Pipeline triggered - waiting 90s ..."
           sleep 90
 
       - name: Run data flow validation
@@ -68,18 +112,16 @@ jobs:
 
       - name: Print deployment report
         run: |
-          SALES=$(docker compose exec -T postgres psql -U ${{ secrets.SALES_DB_USER }} -d salesdb -t -c "SELECT COUNT(*) FROM fact_sales")
-          CUSTOMERS=$(docker compose exec -T postgres psql -U ${{ secrets.SALES_DB_USER }} -d salesdb -t -c "SELECT COUNT(*) FROM dim_customers")
-          RUNS=$(docker compose exec -T postgres psql -U ${{ secrets.SALES_DB_USER }} -d salesdb -t -c "SELECT COUNT(*) FROM pipeline_runs WHERE status='success'")
-
+          SALES=$(docker compose exec -T postgres psql -U datauser -d salesdb -t -c "SELECT COUNT(*) FROM fact_sales" | xargs)
+          CUSTOMERS=$(docker compose exec -T postgres psql -U datauser -d salesdb -t -c "SELECT COUNT(*) FROM dim_customers" | xargs)
+          RUNS=$(docker compose exec -T postgres psql -U datauser -d salesdb -t -c "SELECT COUNT(*) FROM pipeline_runs WHERE status='success'" | xargs)
           echo "=================================="
           echo "  DEPLOYMENT REPORT"
-          echo "=================================="
           echo "  fact_sales rows   : $SALES"
           echo "  dim_customers rows: $CUSTOMERS"
           echo "  Successful runs   : $RUNS"
+          echo "  Deployment complete"
           echo "=================================="
-          echo "  ✅ Deployment complete"
 
       - name: Cleanup
         if: always()
