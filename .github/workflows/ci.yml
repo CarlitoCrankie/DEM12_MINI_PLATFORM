@@ -85,13 +85,15 @@ jobs:
         run: |
           docker compose up -d postgres minio minio-init
           timeout 60 bash -c 'until docker compose exec -T postgres pg_isready -U admin; do sleep 2; done'
-          timeout 60 bash -c 'until docker compose exec -T minio mc ready local 2>/dev/null; do sleep 2; done'
+          timeout 60 bash -c 'until docker compose exec -T minio mc alias set local http://localhost:9000 minio minio123 2>/dev/null; do sleep 2; done'
 
       - name: Run data generator
         run: docker compose run --rm data-generator
 
       - name: Verify files in MinIO
         run: |
+          # Set up alias first then list — the minio container doesn't have it pre-configured
+          docker compose exec -T minio mc alias set local http://localhost:9000 minio minio123
           COUNT=$(docker compose exec -T minio mc ls local/sales-data/raw/ | wc -l)
           echo "Files in MinIO: $COUNT"
           [ "$COUNT" -gt 0 ] || (echo "ERROR: No files uploaded" && exit 1)
