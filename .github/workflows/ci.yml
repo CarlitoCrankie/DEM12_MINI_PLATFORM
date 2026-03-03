@@ -41,8 +41,6 @@ jobs:
           file: Dockerfile
           target: ${{ matrix.target }}
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   integration-test:
     name: Integration Test
