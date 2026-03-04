@@ -1,4 +1,4 @@
-# 📊 Sales Data Platform
+# Sales Data Platform
 
 A fully containerised sales data platform built with Docker Compose that covers the complete data lifecycle — **ingest → process → store → visualise**. Built using industry-standard open source tools that mirror what real companies run at scale.
 
@@ -6,11 +6,11 @@ A fully containerised sales data platform built with Docker Compose that covers 
 
 ---
 
-## 📐 Architecture
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        Mini Data Platform                           │
+│                       Sales Data Platform                           │
 │                                                                     │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐  │
 │  │    Data      │    │    MinIO     │    │   Apache Airflow     │  │
@@ -38,8 +38,8 @@ A fully containerised sales data platform built with Docker Compose that covers 
 │                 ┌────────────────────────────────────────────────┐ │
 │                 │            Metabase  (Port 3000)               │ │
 │                 │                                                │ │
-│                 │  📊 Sales Overview     🏆 Product Performance  │ │
-│                 │  📍 Regional Analysis  ⚙️  Pipeline Health      │ │
+│                 │  Sales Overview     Product Performance  │ │
+│                 │  Regional Analysis  Pipeline Health      │ │
 │                 └────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -58,7 +58,7 @@ CSV Files ──▶ MinIO (raw/) ──▶ Airflow DAG ──▶ PostgreSQL ─�
 
 ---
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 | Component | Technology | Purpose | Port |
 |-----------|-----------|---------|------|
@@ -70,10 +70,10 @@ CSV Files ──▶ MinIO (raw/) ──▶ Airflow DAG ──▶ PostgreSQL ─�
 
 ---
 
-## 🗂️ Project Structure
+## Project Structure
 
 ```
-mini-data-platform/
+sales-data-platform/
 │
 ├── 📄 docker-compose.yml          # Orchestrates all 7 containers
 ├── 📄 Dockerfile                  # Multi-stage: airflow + generator targets
@@ -93,6 +93,8 @@ mini-data-platform/
 ├── 📁 data-generator/
 │   └── 📄 generate_data.py        # Generates ~2,300 sales records across 13 CSV files
 │
+├── 📁 screenshots/                # Dashboard screenshots for documentation
+│
 └── 📁 .github/
     └── 📁 workflows/
         ├── 📄 ci.yml              # Lint → Build → Integration test on every push
@@ -105,16 +107,16 @@ mini-data-platform/
 
 ### Prerequisites
 
-- [Docker](https://docs.docker.com/get-docker/) ≥ 24.0
-- [Docker Compose](https://docs.docker.com/compose/install/) ≥ 2.20
+- [Docker](https://docs.docker.com/get-docker/) >= 24.0
+- [Docker Compose](https://docs.docker.com/compose/install/) >= 2.20
 - 6 GB free RAM
 - 4 GB free disk space
 
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_ORG/mini-data-platform.git
-cd mini-data-platform
+git clone https://github.com/YOUR_ORG/sales-data-platform.git
+cd sales-data-platform
 ```
 
 ### 2. Configure Environment
@@ -147,7 +149,7 @@ curl http://localhost:8080/health
 docker compose run --rm data-generator
 ```
 
-Uploads 13 CSV files (~2,300 sales records) to MinIO.
+Uploads 13 CSV files (~2,300 sales records) to MinIO. Each run uses a unique timestamp in filenames so re-running always produces fresh data.
 
 ### 6. Trigger the Pipeline
 
@@ -159,11 +161,11 @@ Or wait — it runs automatically every hour.
 
 ### 7. Open the Dashboards
 
-Visit [http://localhost:3000](http://localhost:3000) and complete the Metabase setup wizard.
+Visit http://localhost:3000 and complete the Metabase setup wizard using the PostgreSQL credentials below.
 
 ---
 
-## 🔗 Service URLs & Credentials
+## Service URLs & Credentials
 
 | Service | URL | Credentials |
 |---------|-----|-------------|
@@ -176,7 +178,7 @@ Visit [http://localhost:3000](http://localhost:3000) and complete the Metabase s
 
 ---
 
-## 🗄️ Database Schema
+## Database Schema
 
 ```
 ┌────────────────────┐       ┌─────────────────────────────────────┐
@@ -190,7 +192,7 @@ Visit [http://localhost:3000](http://localhost:3000) and complete the Metabase s
                              │ quantity                            │
 ┌────────────────────┐       │ unit_price                          │
 │   dim_products     │       │ discount                            │
-├────────────────────┤       │ total_amount (generated)            │
+├────────────────────┤       │ total_amount (generated column)     │
 │ product_id   (PK)  │◀──────│ region                              │
 │ product_name       │       │ channel                             │
 │ category           │       │ source_file                         │
@@ -204,7 +206,7 @@ Audit Table       : pipeline_runs
 
 ---
 
-## ⚙️ Airflow Pipelines
+## Airflow Pipelines
 
 ### `sales_pipeline` — runs hourly
 
@@ -222,6 +224,8 @@ process_and_load      ← clean, upsert into fact/dim tables
       └──▶ log_runs                   ← audit trail in pipeline_runs
 ```
 
+> The pipeline tracks processed filenames in `pipeline_runs`. Re-running the generator always produces new unique filenames (timestamped) so the pipeline picks them up correctly on every run.
+
 ### `data_flow_validation` — manual / CI trigger
 
 Validates every hop end-to-end:
@@ -233,9 +237,23 @@ Validates every hop end-to-end:
 
 ---
 
-## 📊 Metabase Dashboards
+## Metabase Dashboards
 
-Four dashboards built on top of five reusable **Models**:
+### Connecting to PostgreSQL
+On first visit, complete the setup wizard and add a database connection:
+
+```
+Engine:   PostgreSQL
+Host:     postgres
+Port:     5432
+Database: salesdb
+Username: datauser
+Password: datapass
+```
+
+### Models
+
+Five reusable models form the foundation of all dashboards:
 
 | Model | Source | Purpose |
 |-------|--------|---------|
@@ -252,53 +270,57 @@ High-level business health: revenue trends, order volume, channel breakdown, qua
 Top products by revenue, category breakdown, discount impact and category trends over time.
 
 ### Dashboard 3 — Regional Performance
-Revenue and orders by region, region × channel breakdown and regional trends over time.
+Revenue and orders by region, region x channel breakdown and regional trends over time.
 
 ### Dashboard 4 — Pipeline Health
 Pipeline run history, rows loaded per file, data freshness indicator and error monitoring.
 
+> **Keeping dashboards live:** Metabase caches queries. Click the refresh button on each dashboard to pull the latest data. Set auto-refresh to 1–5 minutes in dashboard settings for live updates. After each pipeline run, the `mv_monthly_sales` materialised view is refreshed automatically by Airflow.
+
 ---
 
-## 🔄 CI/CD Pipeline
+## CI/CD Pipeline
 
 ### CI — runs on every push
 
 1. **Lint** — flake8 on all DAGs and generator code
 2. **Build** — Docker image built for both `airflow` and `generator` stages
-3. **Integration Test** — spins up Postgres + MinIO, runs generator, verifies files land correctly
+3. **Integration Test** — spins up Postgres + MinIO, runs generator, verifies files uploaded correctly
 4. **Security Scan** — pip-audit on all Python dependencies
 
 ### CD — runs on merge to `main`
 
-1. Writes `.env` from GitHub Secrets
-2. Deploys full stack with `docker compose up -d`
-3. Runs data generator to seed MinIO
-4. Triggers `sales_pipeline` DAG
-5. Triggers `data_flow_validation` DAG
-6. Prints end-to-end metrics report
-7. Tears down test environment
+1. Writes `.env` from GitHub Secrets (with safe defaults for test environment)
+2. Starts PostgreSQL and MinIO first, waits for healthy status
+3. Initialises MinIO buckets
+4. Starts and waits for Airflow to fully initialise
+5. Runs data generator to seed MinIO
+6. Triggers `sales_pipeline` DAG
+7. Triggers `data_flow_validation` DAG
+8. Prints end-to-end metrics report
+9. Tears down test environment
 
 ---
 
-## 🧰 Useful Commands
+## Useful Commands
 
 ```bash
-make up           # Start all services
-make down         # Stop services (keep data)
-make clean        # Stop and wipe all volumes
-make logs         # Follow all logs
-make ps           # Show container status
-make generate     # Upload sample data to MinIO
-make trigger      # Trigger the sales pipeline DAG
-make validate     # Trigger the validation DAG
-make health       # Check all 4 services are alive
-make shell-pg     # Open psql prompt to salesdb
+make up            # Start all services
+make down          # Stop services (keep data)
+make clean         # Stop and wipe all volumes
+make logs          # Follow all logs
+make ps            # Show container status
+make generate      # Upload sample data to MinIO
+make trigger       # Trigger the sales pipeline DAG
+make validate      # Trigger the validation DAG
+make health        # Check all 4 services are alive
+make shell-pg      # Open psql prompt to salesdb
 make shell-airflow # Open bash in Airflow scheduler
 ```
 
 ---
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
@@ -306,12 +328,16 @@ make shell-airflow # Open bash in Airflow scheduler
 | DAG not found | Wait 30s for scheduler to scan — run `airflow dags list` to confirm |
 | Metabase blank screen | JVM takes 2–3 min to boot — refresh after waiting |
 | MinIO has no files | Re-run `docker compose run --rm data-generator` |
+| Pipeline shows 0 new files | Rebuild the generator `docker compose build data-generator` then re-run |
+| Metabase not showing new data | Hit refresh on dashboard; also run `REFRESH MATERIALIZED VIEW mv_monthly_sales;` |
 | `must be owner of materialized view` | Run `docker compose exec postgres psql -U admin -d salesdb -c "ALTER MATERIALIZED VIEW mv_monthly_sales OWNER TO datauser;"` |
+| `source must be CopySource type` | MinIO SDK v7+ issue — ensure you are on the latest version of the codebase |
+| `permission denied for table fact_sales` | Run `docker compose exec postgres psql -U admin -d salesdb -c "GRANT ALL ON ALL TABLES IN SCHEMA public TO datauser;"` |
 | Port already in use | Update the port in `.env` and restart |
 
 ---
 
-## 📸 Dashboard Screenshots
+## Dashboard Screenshots
 
 > Screenshots taken from the live platform running locally via Docker Compose.
 
@@ -325,13 +351,13 @@ make shell-airflow # Open bash in Airflow scheduler
 
 ### Regional Performance
 ![Regional Performance](screenshots/dashboard-regional-performance.png)
-*Revenue and order distribution across regions with quarterly pivot breakdown.*
+*Revenue and order distribution across regions with quarterly breakdown.*
 
 ### Pipeline Health
 ![Pipeline Health](screenshots/dashboard-pipeline-health.png)
 *Airflow pipeline run history, rows loaded per file and data freshness monitoring.*
 
-> 📁 All screenshots stored in the `/screenshots` folder of this repository.
+> All screenshots stored in the `/screenshots` folder of this repository.
 
 ---
 
@@ -350,4 +376,4 @@ make shell-airflow # Open bash in Airflow scheduler
 
 ## 📜 License
 
-MIT © Mini Data Platform
+MIT © Sales Data Platform

@@ -48,8 +48,7 @@ REGIONS  = ["North", "South", "East", "West", "Central"]
 CHANNELS = ["Online", "In-Store", "Wholesale", "Partner"]
 
 fake = Faker()
-Faker.seed(42)
-random.seed(42)
+# No fixed seed — each run generates unique order IDs
 
 
 def get_minio_client() -> Minio:
@@ -118,16 +117,19 @@ def main() -> None:
 
     today = datetime.now()
 
+    # Use a run timestamp so every generator run produces unique filenames
+    run_ts = today.strftime('%Y%m%d_%H%M%S')
+
     # 12 monthly historical files
     for offset in range(12, 0, -1):
         start = today.replace(day=1) - timedelta(days=30 * offset)
         end   = start + timedelta(days=29)
         df    = generate_batch(random.randint(150, 400), start, end)
-        upload_csv(client, df, f"sales_{start.strftime('%Y_%m')}.csv")
+        upload_csv(client, df, f"sales_{start.strftime('%Y_%m')}_{run_ts}.csv")
 
     # Live / today file
     df_today = generate_batch(50, today - timedelta(hours=6), today)
-    upload_csv(client, df_today, f"sales_{today.strftime('%Y_%m_%d')}_latest.csv")
+    upload_csv(client, df_today, f"sales_{today.strftime('%Y_%m_%d')}_{run_ts}_latest.csv")
 
     log.info("Done — 13 files uploaded to MinIO bucket '%s/raw/'", MINIO_BUCKET)
 

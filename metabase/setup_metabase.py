@@ -235,7 +235,7 @@ def main():
         log.info("Created question: %s (id=%d)", q["name"], qid)
 
     log.info("")
-    log.info("✅  Metabase setup complete!")
+    log.info("Metabase setup complete!")
     log.info("    Open http://localhost:3000 and log in with:")
     log.info("    Email:    %s", ADMIN_EMAIL)
     log.info("    Password: %s", ADMIN_PASS)
