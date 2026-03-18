@@ -1,15 +1,19 @@
 name: CD — Deploy to Test Environment
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI — Build & Test"]
+    types: [completed]
     branches: [main]
 
 jobs:
   deploy:
     name: Deploy & Validate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    environment: test
+    timeout-minutes: 25
+
+    # Only deploy if CI passed — never deploy on failure
+    if: github.event.workflow_run.conclusion == 'success'
 
     steps:
       - uses: actions/checkout@v4
@@ -43,27 +47,22 @@ jobs:
           AIRFLOW_SECRET_KEY=${{ secrets.AIRFLOW_SECRET_KEY || 'a25mQ1FHTUh3MnFRSk5KMEIyVVU2YmN0VGRyYTVXY2' }}
           METABASE_PORT=3000
           EOF
-          echo ".env written successfully"
 
-      - name: Start PostgreSQL and MinIO first
+      - name: Start PostgreSQL and MinIO
         run: |
           docker compose up -d postgres minio
-          echo "Waiting for PostgreSQL to be healthy ..."
           timeout 120 bash -c '
             until docker inspect mdp-postgres --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do
-              echo "  postgres: $(docker inspect mdp-postgres --format={{.State.Health.Status}} 2>/dev/null || echo starting)"
               sleep 5
             done
           '
-          echo "PostgreSQL is healthy"
-          echo "Waiting for MinIO to be healthy ..."
+          echo "PostgreSQL healthy"
           timeout 60 bash -c '
             until docker inspect mdp-minio --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do
-              echo "  minio: $(docker inspect mdp-minio --format={{.State.Health.Status}} 2>/dev/null || echo starting)"
               sleep 5
             done
           '
-          echo "MinIO is healthy"
+          echo "MinIO healthy"
 
       - name: Initialise MinIO buckets
         run: |
@@ -78,31 +77,38 @@ jobs:
       - name: Start Airflow
         run: |
           docker compose up -d airflow-init
-          echo "Waiting for Airflow to initialise ..."
           timeout 180 bash -c '
             until docker compose logs airflow-init 2>/dev/null | grep -q "Airflow initialised"; do
-              echo "  waiting for airflow-init ..."
               sleep 5
             done
           '
-          echo "Airflow init complete"
           docker compose up -d airflow-webserver airflow-scheduler
-          echo "Waiting for Airflow webserver ..."
           timeout 120 bash -c '
             until curl -sf http://localhost:8080/health 2>/dev/null | grep -q "healthy"; do
-              echo "  waiting for airflow webserver ..."
               sleep 5
             done
           '
-          echo "Airflow webserver ready"
+          echo "Airflow ready"
 
-      - name: Generate & upload sample data
+      - name: Generate and upload sample data
         run: docker compose run --rm data-generator
+
+      - name: Wait for DAG to be discovered
+        run: |
+          echo "Waiting for sales_pipeline DAG ..."
+          timeout 120 bash -c '
+            until docker compose exec -T airflow-scheduler \
+              airflow dags list 2>/dev/null | grep -q "sales_pipeline"; do
+              echo "  DAG not yet visible ..."
+              sleep 10
+            done
+          '
+          echo "DAG discovered"
 
       - name: Trigger sales pipeline
         run: |
           docker compose exec -T airflow-scheduler airflow dags trigger sales_pipeline
-          echo "Pipeline triggered - waiting 90s ..."
+          echo "Pipeline triggered, waiting 90s ..."
           sleep 90
 
       - name: Run data flow validation
