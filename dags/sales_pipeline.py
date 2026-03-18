@@ -17,8 +17,8 @@ from minio.commonconfig import CopySource
 from minio.error import S3Error
 
 from airflow import DAG
-from airflow.decorators import task
-from airflow.utils.timezone import datetime
+from airflow.sdk.task import task
+from airflow.sdk.timezone import datetime
 
 log = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ with DAG(
     dag_id="sales_pipeline",
     default_args=default_args,
     description="MinIO (raw CSV) → clean → PostgreSQL → archive",
-    schedule_interval="@hourly",
+    schedule="@hourly",
     start_date=datetime(2025, 1, 1),
     catchup=False,
     tags=["sales", "etl"],

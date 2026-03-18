@@ -15,8 +15,8 @@ import psycopg2
 from minio import Minio
 
 from airflow import DAG
-from airflow.decorators import task
-from airflow.utils.timezone import datetime
+from airflow.sdk.task import task
+from airflow.sdk.timezone import datetime
 
 log = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ with DAG(
     dag_id="data_flow_validation",
     default_args=default_args,
     description="End-to-end validation: MinIO → Airflow → PostgreSQL → views",
-    schedule_interval=None,
+    schedule=None,
     start_date=datetime(2025, 1, 1),
     catchup=False,
     tags=["validation", "ci"],
