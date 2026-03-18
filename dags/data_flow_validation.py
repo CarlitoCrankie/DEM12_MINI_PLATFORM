@@ -1,6 +1,6 @@
 """
 Mini Data Platform — Data Flow Validation DAG
-Validates every hop in the pipeline: MinIO → Airflow → PostgreSQL → views.
+Validates every hop in the pipeline: MinIO -> Airflow -> PostgreSQL -> views.
 Triggered manually or by CI/CD — not scheduled.
 """
 
@@ -15,8 +15,8 @@ import psycopg2
 from minio import Minio
 
 from airflow import DAG
-from airflow.sdk.task import task
-from airflow.sdk.timezone import datetime
+from airflow.decorators import task
+from airflow.utils.dates import days_ago
 
 log = logging.getLogger(__name__)
 
@@ -60,9 +60,9 @@ default_args = {
 with DAG(
     dag_id="data_flow_validation",
     default_args=default_args,
-    description="End-to-end validation: MinIO → Airflow → PostgreSQL → views",
-    schedule=None,
-    start_date=datetime(2025, 1, 1),
+    description="End-to-end validation: MinIO -> Airflow -> PostgreSQL -> views",
+    schedule_interval=None,
+    start_date=days_ago(1),
     catchup=False,
     tags=["validation", "ci"],
 ) as dag:
@@ -73,9 +73,8 @@ with DAG(
         buckets = [b.name for b in mc.list_buckets()]
         assert SOURCE_BUCKET in buckets, f"Bucket '{SOURCE_BUCKET}' missing. Found: {buckets}"
         count = sum(1 for _ in mc.list_objects(SOURCE_BUCKET, recursive=True))
-        log.info("MinIO ✓  bucket=%s  objects=%d", SOURCE_BUCKET, count)
+        log.info("MinIO OK — bucket=%s  objects=%d", SOURCE_BUCKET, count)
         return {"status": "ok", "bucket": SOURCE_BUCKET, "object_count": count}
-
 
     @task
     def check_postgres_schema() -> dict:
@@ -85,14 +84,11 @@ with DAG(
                 WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
             """)
             tables = [r[0] for r in cur.fetchall()]
-
         required = {"fact_sales", "dim_products", "dim_customers", "pipeline_runs"}
         missing  = required - set(tables)
         assert not missing, f"Missing tables: {missing}"
-
-        log.info("PostgreSQL ✓  tables=%s", tables)
+        log.info("PostgreSQL OK — tables=%s", tables)
         return {"status": "ok", "tables": tables}
-
 
     @task
     def check_data_counts() -> dict:
@@ -105,12 +101,10 @@ with DAG(
             products = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM pipeline_runs WHERE status = 'success'")
             runs = cur.fetchone()[0]
-
         assert products > 0, "No products seeded — check init_db.sql"
-        log.info("Rows — fact_sales=%d  customers=%d  products=%d  pipeline_runs=%d",
+        log.info("Rows: fact_sales=%d  customers=%d  products=%d  pipeline_runs=%d",
                  sales, customers, products, runs)
         return {"fact_sales": sales, "customers": customers, "products": products, "pipeline_runs": runs}
-
 
     @task
     def check_materialized_view() -> dict:
@@ -120,10 +114,8 @@ with DAG(
         log.info("mv_monthly_sales rows: %d", count)
         return {"mv_monthly_sales_rows": count}
 
-
     @task
     def check_minio_roundtrip() -> str:
-        """Upload a tiny test CSV, read it back, then delete it."""
         test_csv = (
             "order_id,sale_date,customer_name,customer_email,region,channel,"
             "product_id,product_name,category,quantity,unit_price,discount_pct,total_amount\n"
@@ -134,16 +126,13 @@ with DAG(
         key  = "validation/roundtrip_test.csv"
         data = test_csv.encode()
         mc.put_object(SOURCE_BUCKET, key, io.BytesIO(data), len(data), content_type="text/csv")
-
         resp    = mc.get_object(SOURCE_BUCKET, key)
         content = resp.read().decode()
         resp.close()
         mc.remove_object(SOURCE_BUCKET, key)
-
         assert "TEST0001" in content, "Round-trip content mismatch"
-        log.info("MinIO round-trip ✓")
+        log.info("MinIO round-trip OK")
         return "ok"
-
 
     @task
     def summarise(minio: dict, schema: dict, counts: dict, view: dict, roundtrip: str) -> None:
@@ -157,10 +146,8 @@ with DAG(
         log.info("Monthly view  : %d rows",             view["mv_monthly_sales_rows"])
         log.info("MinIO R/T     : %s",                  roundtrip)
         log.info("=" * 55)
-        log.info("ALL CHECKS PASSED ✓")
+        log.info("ALL CHECKS PASSED")
 
-
-    # Wire tasks
     m  = check_minio()
     s  = check_postgres_schema()
     c  = check_data_counts()

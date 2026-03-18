@@ -17,8 +17,8 @@ from minio.commonconfig import CopySource
 from minio.error import S3Error
 
 from airflow import DAG
-from airflow.sdk.task import task
-from airflow.sdk.timezone import datetime
+from airflow.decorators import task
+from airflow.utils.dates import days_ago
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +50,6 @@ REQUIRED_COLUMNS = {
 }
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 def get_minio() -> Minio:
     endpoint = MINIO_ENDPOINT.replace("http://", "").replace("https://", "")
     return Minio(endpoint, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=False)
@@ -60,7 +59,6 @@ def get_pg():
     return psycopg2.connect(**PG_CONFIG)
 
 
-# ── DAG ───────────────────────────────────────────────────────────────────────
 default_args = {
     "owner":            "data-platform",
     "retries":          2,
@@ -71,18 +69,16 @@ default_args = {
 with DAG(
     dag_id="sales_pipeline",
     default_args=default_args,
-    description="MinIO (raw CSV) → clean → PostgreSQL → archive",
-    schedule="@hourly",
-    start_date=datetime(2025, 1, 1),
+    description="MinIO (raw CSV) -> clean -> PostgreSQL -> archive",
+    schedule_interval="@hourly",
+    start_date=days_ago(1),
     catchup=False,
     tags=["sales", "etl"],
 ) as dag:
 
     @task
-    def list_new_files() -> list[str]:
-        """List raw/ CSVs in MinIO that haven't been successfully processed yet."""
+    def list_new_files() -> list:
         mc = get_minio()
-
         try:
             with get_pg() as conn, conn.cursor() as cur:
                 cur.execute("SELECT source_file FROM pipeline_runs WHERE status = 'success'")
@@ -95,27 +91,21 @@ with DAG(
             for obj in mc.list_objects(SOURCE_BUCKET, prefix="raw/", recursive=True)
             if obj.object_name.endswith(".csv")
         ]
-
         new_files = [f for f in all_files if f not in processed]
         log.info("%d new file(s) found.", len(new_files))
         return new_files
 
-
     @task
-    def validate_files(file_list: list[str]) -> list[str]:
-        """Check each file has required columns and at least one row."""
+    def validate_files(file_list: list) -> list:
         if not file_list:
             return []
-
         mc    = get_minio()
         valid = []
-
         for obj in file_list:
             try:
                 resp = mc.get_object(SOURCE_BUCKET, obj)
                 df   = pd.read_csv(io.BytesIO(resp.read()))
                 resp.close()
-
                 missing = REQUIRED_COLUMNS - set(df.columns)
                 if missing:
                     log.warning("Skipping %s — missing columns: %s", obj, missing)
@@ -123,32 +113,24 @@ with DAG(
                 if df.empty:
                     log.warning("Skipping %s — file is empty.", obj)
                     continue
-
                 valid.append(obj)
-                log.info("✓ %s  (%d rows)", obj, len(df))
-
+                log.info("Validated %s (%d rows)", obj, len(df))
             except Exception as exc:
                 log.error("Validation error for %s: %s", obj, exc)
-
         return valid
 
-
     @task
-    def process_and_load(file_list: list[str]) -> list[dict]:
-        """Clean CSV data and upsert into PostgreSQL star schema."""
+    def process_and_load(file_list: list) -> list:
         if not file_list:
             return []
-
         mc      = get_minio()
         results = []
-
         for obj in file_list:
             try:
                 resp = mc.get_object(SOURCE_BUCKET, obj)
                 df   = pd.read_csv(io.BytesIO(resp.read()))
                 resp.close()
 
-                # Cleaning
                 df = df.dropna(subset=["order_id", "sale_date", "product_id"])
                 df["sale_date"]    = pd.to_datetime(df["sale_date"], errors="coerce").dt.date
                 df["quantity"]     = pd.to_numeric(df["quantity"],     errors="coerce").fillna(1).astype(int)
@@ -159,11 +141,8 @@ with DAG(
                 df = df.dropna(subset=["sale_date"])
 
                 rows_loaded = 0
-
                 with get_pg() as conn, conn.cursor() as cur:
                     for _, row in df.iterrows():
-
-                        # Upsert customer
                         cur.execute("""
                             INSERT INTO dim_customers (customer_name, email, region)
                             VALUES (%s, %s, %s)
@@ -174,7 +153,6 @@ with DAG(
                         """, (row["customer_name"], row["customer_email"], row["region"]))
                         customer_id = cur.fetchone()[0]
 
-                        # Upsert product
                         cur.execute("""
                             INSERT INTO dim_products (product_id, product_name, category, unit_price)
                             VALUES (%s, %s, %s, %s)
@@ -186,7 +164,6 @@ with DAG(
                         """, (int(row["product_id"]), row["product_name"], row["category"], float(row["unit_price"])))
                         product_id = cur.fetchone()[0]
 
-                        # Insert sale
                         cur.execute("""
                             INSERT INTO fact_sales
                               (order_id, sale_date, customer_id, product_id,
@@ -206,22 +183,17 @@ with DAG(
                             obj,
                         ))
                         rows_loaded += cur.rowcount
-
                     conn.commit()
 
                 log.info("Loaded %d rows from %s", rows_loaded, obj)
                 results.append({"file": obj, "rows": rows_loaded, "status": "success"})
-
             except Exception as exc:
                 log.error("Failed to process %s: %s", obj, exc)
                 results.append({"file": obj, "rows": 0, "status": "error", "error": str(exc)})
-
         return results
 
-
     @task
-    def refresh_materialized_views(results: list[dict]) -> None:
-        """Refresh mv_monthly_sales after a successful load."""
+    def refresh_materialized_views(results: list) -> None:
         if not any(r["status"] == "success" for r in results):
             log.info("No successful loads — skipping view refresh.")
             return
@@ -230,35 +202,25 @@ with DAG(
             conn.commit()
         log.info("Refreshed mv_monthly_sales.")
 
-
     @task
-    def archive_files(results: list[dict]) -> None:
-        """Move processed files from raw/ to archive/ in MinIO."""
+    def archive_files(results: list) -> None:
         mc = get_minio()
-
         if not mc.bucket_exists(ARCHIVE_BUCKET):
             mc.make_bucket(ARCHIVE_BUCKET)
-
         for r in results:
             if r["status"] != "success":
                 continue
             src     = r["file"]
             archive = src.replace("raw/", "archive/")
             try:
-                mc.copy_object(
-                    ARCHIVE_BUCKET,
-                    archive,
-                    CopySource(SOURCE_BUCKET, src),
-                )
+                mc.copy_object(ARCHIVE_BUCKET, archive, CopySource(SOURCE_BUCKET, src))
                 mc.remove_object(SOURCE_BUCKET, src)
-                log.info("Archived %s → %s/%s", src, ARCHIVE_BUCKET, archive)
+                log.info("Archived %s -> %s/%s", src, ARCHIVE_BUCKET, archive)
             except S3Error as exc:
                 log.error("Archive failed for %s: %s", src, exc)
 
-
     @task
-    def log_runs(results: list[dict]) -> None:
-        """Write pipeline run metadata to pipeline_runs table."""
+    def log_runs(results: list) -> None:
         if not results:
             return
         with get_pg() as conn, conn.cursor() as cur:
@@ -270,12 +232,10 @@ with DAG(
             conn.commit()
         log.info("Logged %d run record(s).", len(results))
 
-
-    # ── Wire up ───────────────────────────────────────────────────────────────
+    # Wire up
     files   = list_new_files()
     valid   = validate_files(files)
     results = process_and_load(valid)
-
     refresh_materialized_views(results)
     archive_files(results)
     log_runs(results)
