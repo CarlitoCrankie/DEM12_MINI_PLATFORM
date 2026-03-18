@@ -16,7 +16,7 @@ from minio import Minio
 
 from airflow import DAG
 from airflow.decorators import task
-from airflow.utils.dates import days_ago
+from airflow.utils.timezone import datetime
 
 log = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ with DAG(
     default_args=default_args,
     description="End-to-end validation: MinIO → Airflow → PostgreSQL → views",
     schedule_interval=None,
-    start_date=days_ago(1),
+    start_date=datetime(2025, 1, 1),
     catchup=False,
     tags=["validation", "ci"],
 ) as dag:

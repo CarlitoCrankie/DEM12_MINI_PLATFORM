@@ -8,7 +8,7 @@ from __future__ import annotations
 import io
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pandas as pd
 import psycopg2
@@ -18,7 +18,7 @@ from minio.error import S3Error
 
 from airflow import DAG
 from airflow.decorators import task
-from airflow.utils.dates import days_ago
+from airflow.utils.timezone import datetime
 
 log = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ with DAG(
     default_args=default_args,
     description="MinIO (raw CSV) → clean → PostgreSQL → archive",
     schedule_interval="@hourly",
-    start_date=days_ago(1),
+    start_date=datetime(2025, 1, 1),
     catchup=False,
     tags=["sales", "etl"],
 ) as dag:
