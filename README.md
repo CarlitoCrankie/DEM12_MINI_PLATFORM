@@ -7,7 +7,7 @@ A fully containerised sales data platform built with Docker Compose that covers 
 ---
 
 ## Architecture
-
+![System_Architecture](System_Architecture.drawio.png)
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                       Sales Data Platform                           │
@@ -38,8 +38,8 @@ A fully containerised sales data platform built with Docker Compose that covers 
 │                 ┌────────────────────────────────────────────────┐ │
 │                 │            Metabase  (Port 3000)               │ │
 │                 │                                                │ │
-│                 │  Sales Overview     Product Performance  │ │
-│                 │  Regional Analysis  Pipeline Health      │ │
+│                 │  Sales Overview        Product Performance   │ │
+│                 │  Regional Analysis     Pipeline Health        │ │
 │                 └────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -75,35 +75,41 @@ CSV Files ──▶ MinIO (raw/) ──▶ Airflow DAG ──▶ PostgreSQL ─�
 ```
 sales-data-platform/
 │
-├── 📄 docker-compose.yml          # Orchestrates all 7 containers
-├── 📄 Dockerfile                  # Multi-stage: airflow + generator targets
-├── 📄 requirements.txt            # All Python dependencies in one file
-├── 📄 .env                        # All config and credentials (never commit)
-├── 📄 .env.example                # Safe template to commit
-├── 📄 .gitignore
-├── 📄 Makefile                    # Helper commands
+├── docker-compose.yml          # Orchestrates all 7 containers
+├── Dockerfile                  # Multi-stage: airflow + generator targets
+├── requirements.txt            # All Python dependencies in one file
+├── .env                        # All config and credentials (never commit)
+├── .env.example                # Safe template to commit
+├── .gitignore
+├── Makefile                    # Helper commands
 │
-├── 📁 scripts/
-│   └── 📄 init_db.sql             # PostgreSQL schema, views & seed data
+├── scripts/
+│   └── init_db.sql             # PostgreSQL schema, views & seed data
 │
-├── 📁 dags/
-│   ├── 📄 sales_pipeline.py       # Main ETL DAG — runs hourly
-│   └── 📄 data_flow_validation.py # Health check DAG — manual / CI trigger
+├── dags/
+│   ├── sales_pipeline.py       # Main ETL DAG — runs hourly
+│   └── data_flow_validation.py # Health check DAG — manual / CI trigger
 │
-├── 📁 data-generator/
-│   └── 📄 generate_data.py        # Generates ~2,300 sales records across 13 CSV files
+├── data-generator/
+│   └── generate_data.py        # Generates ~2,300 sales records across 13 CSV files
 │
-├── 📁 screenshots/                # Dashboard screenshots for documentation
+├── screenshots/                # Dashboard screenshots for documentation
 │
-└── 📁 .github/
-    └── 📁 workflows/
-        ├── 📄 ci.yml              # Lint → Build → Integration test on every push
-        └── 📄 cd.yml              # Full deploy + validation on merge to main
+├── tests/
+│   ├── conftest.py              # Shared pytest fixtures
+│   ├── test_generator.py         # Unit tests for data generator
+│   ├── test_dags.py              # DAG structure & task config tests
+│   └── test_integration.py       # Full stack integration tests
+│
+└── .github/
+    └── workflows/
+        ├── ci.yml              # Lint → Build → Integration test on every push
+        └── cd.yml              # Full deploy + validation on merge to main
 ```
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
@@ -115,7 +121,7 @@ sales-data-platform/
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_ORG/sales-data-platform.git
+git clone https://github.com/YOUR-USERNAME/sales-data-platform.git
 cd sales-data-platform
 ```
 
@@ -279,14 +285,15 @@ Pipeline run history, rows loaded per file, data freshness indicator and error m
 
 ---
 
-## CI/CD Pipeline
+## 🔄 CI/CD Pipeline
 
 ### CI — runs on every push
 
 1. **Lint** — flake8 on all DAGs and generator code
-2. **Build** — Docker image built for both `airflow` and `generator` stages
-3. **Integration Test** — spins up Postgres + MinIO, runs generator, verifies files uploaded correctly
-4. **Security Scan** — pip-audit on all Python dependencies
+2. **Unit Tests** — pytest on `test_generator.py` and `test_dags.py`
+3. **Build** — Docker image built for both `airflow` and `generator` stages
+4. **Integration Test** — spins up Postgres + MinIO, runs generator, verifies files uploaded correctly
+5. **Security Scan** — pip-audit on all Python dependencies
 
 ### CD — runs on merge to `main`
 
@@ -302,7 +309,7 @@ Pipeline run history, rows loaded per file, data freshness indicator and error m
 
 ---
 
-## Useful Commands
+## 🧰 Useful Commands
 
 ```bash
 make up            # Start all services
@@ -316,11 +323,13 @@ make validate      # Trigger the validation DAG
 make health        # Check all 4 services are alive
 make shell-pg      # Open psql prompt to salesdb
 make shell-airflow # Open bash in Airflow scheduler
+make test          # Run unit tests
+make test-all      # Run unit + integration tests (requires services running)
 ```
 
 ---
 
-## Troubleshooting
+## 🔧 Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
@@ -337,7 +346,7 @@ make shell-airflow # Open bash in Airflow scheduler
 
 ---
 
-## Dashboard Screenshots
+## 📸 Dashboard Screenshots
 
 > Screenshots taken from the live platform running locally via Docker Compose.
 

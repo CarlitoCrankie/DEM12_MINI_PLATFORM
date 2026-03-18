@@ -118,3 +118,9 @@ jobs:
       - name: Cleanup
         if: always()
         run: docker compose down -v
+
+      - name: Run unit tests
+        run: |
+          pip install pytest pandas faker minio apache-airflow
+          pytest tests/test_generator.py tests/test_dags.py -v
+          pytest tests/test_integration.py -v
