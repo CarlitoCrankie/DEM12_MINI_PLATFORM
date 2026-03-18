@@ -55,7 +55,7 @@ class TestSalesPipelineDag:
         assert dag.dag_id == "sales_pipeline"
 
     def test_dag_has_correct_schedule(self, dag):
-        assert dag.schedule_interval == "@hourly"
+        assert dag.schedule == "@hourly"
 
     def test_dag_tags(self, dag):
         assert "sales" in dag.tags
