@@ -57,7 +57,10 @@ jobs:
             "AIRFLOW_ADMIN_EMAIL=${AIRFLOW_ADMIN_EMAIL}" \
             "AIRFLOW_FERNET_KEY=${AIRFLOW_FERNET_KEY}" \
             "AIRFLOW_SECRET_KEY=${AIRFLOW_SECRET_KEY}" \
-            "METABASE_PORT=3000" > .env
+            "METABASE_PORT=3000" \
+            "AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth" \
+            "AIRFLOW__CORE__SQL_ALCHEMY_POOL_RECYCLE=1800" \
+            "AIRFLOW__CORE__SQL_ALCHEMY_POOL_SIZE=5" > .env
 
       # ── Start services ──────────────────────────────────────────────────
       - name: Start PostgreSQL and MinIO

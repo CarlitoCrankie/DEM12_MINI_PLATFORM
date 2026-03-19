@@ -87,7 +87,10 @@ jobs:
             "AIRFLOW_ADMIN_EMAIL=admin@ci.local" \
             "AIRFLOW_FERNET_KEY=81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs=" \
             "AIRFLOW_SECRET_KEY=a25mQ1FHTUh3MnFRSk5KMEIyVVU2YmN0VGRyYTVXY2" \
-            "METABASE_PORT=3000" > .env
+            "METABASE_PORT=3000" \
+            "AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth" \
+            "AIRFLOW__CORE__SQL_ALCHEMY_POOL_RECYCLE=1800" \
+            "AIRFLOW__CORE__SQL_ALCHEMY_POOL_SIZE=5" > .env
 
       # ── Step 1: Start database and storage ──────────────────────────────
       - name: Start PostgreSQL and MinIO
