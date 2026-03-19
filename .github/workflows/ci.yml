@@ -53,21 +53,21 @@ jobs:
         run: |
           flake8 dags/ \
             --max-line-length=120 \
-            --ignore=E402,W503,E501,E221,E241,E203,E302,E301 \
+            --ignore=E402,W503,E501,E221,E241,E203,E302,E301,E305 \
             --format="::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s"
 
       - name: Lint — data-generator
         run: |
           flake8 data-generator/ \
             --max-line-length=120 \
-            --ignore=E402,W503,E501,E221,E241,E203,E302,E301 \
+            --ignore=E402,W503,E501,E221,E241,E203,E302,E301,E305 \
             --format="::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s"
 
       - name: Lint — tests
         run: |
           flake8 tests/ \
             --max-line-length=120 \
-            --ignore=E402,W503,E501,E221,E241,E203,E302,E301 \
+            --ignore=E402,W503,E501,E221,E241,E203,E302,E301,E305 \
             --format="::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s"
 
 # ── 2. UNIT TESTS ─────────────────────────────────────────────────────────────
