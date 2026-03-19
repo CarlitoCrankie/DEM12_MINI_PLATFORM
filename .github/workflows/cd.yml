@@ -108,9 +108,34 @@ jobs:
           docker compose exec -T postgres psql -U admin -d salesdb << 'SQL'
             GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO datauser;
             GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO datauser;
-            ALTER MATERIALIZED VIEW IF EXISTS mv_monthly_sales OWNER TO datauser;
+
+            DO $$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1 FROM pg_matviews WHERE schemaname = 'public' AND matviewname = 'mv_monthly_sales'
+              ) THEN
+                CREATE MATERIALIZED VIEW mv_monthly_sales AS
+                SELECT
+                  DATE_TRUNC('month', sale_date) AS month,
+                  region,
+                  channel,
+                  p.category,
+                  COUNT(*)          AS total_orders,
+                  SUM(quantity)     AS total_units,
+                  SUM(total_amount) AS total_revenue,
+                  AVG(total_amount) AS avg_order_value
+                FROM fact_sales fs
+                JOIN dim_products p USING (product_id)
+                GROUP BY 1, 2, 3, 4;
+
+                CREATE UNIQUE INDEX idx_mv_monthly_sales
+                  ON mv_monthly_sales (month, region, channel, category);
+              END IF;
+            END $$;
+
+            ALTER MATERIALIZED VIEW mv_monthly_sales OWNER TO datauser;
           SQL
-          echo "Permissions fixed"
+          echo "Permissions and materialized view fixed"
 
       # ── Seed data ───────────────────────────────────────────────────────
       - name: Generate and upload sample data
