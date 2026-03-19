@@ -106,18 +106,41 @@ jobs:
 
       # ── Wait for DAG ────────────────────────────────────────────────────
       - name: Wait for DAG discovery
-        run: |
-          timeout 120 bash -c '
-            until curl -sf -u ${AIRFLOW_ADMIN_USER}:${AIRFLOW_ADMIN_PASSWORD} \
-              http://localhost:8080/api/v1/dags/sales_pipeline 2>/dev/null \
-              | grep -q "sales_pipeline"; do
-              echo "  waiting for DAG..."
-              sleep 10
-            done'
-          echo "DAG ready"
         env:
           AIRFLOW_ADMIN_USER: ${{ secrets.AIRFLOW_ADMIN_USER || 'admin' }}
           AIRFLOW_ADMIN_PASSWORD: ${{ secrets.AIRFLOW_ADMIN_PASSWORD || 'admin' }}
+        run: |
+          echo "Waiting for DAGs to be discovered (max 5 min)..."
+          for i in $(seq 1 30); do
+            RESPONSE=$(curl -sf -u ${AIRFLOW_ADMIN_USER}:${AIRFLOW_ADMIN_PASSWORD} \
+              http://localhost:8080/api/v1/dags/sales_pipeline 2>/dev/null || echo "")
+            if echo "$RESPONSE" | grep -q "sales_pipeline"; then
+              echo "sales_pipeline DAG found after $i attempt(s)"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: DAG not found after 5 minutes"
+              echo "--- Airflow scheduler logs ---"
+              docker compose logs --tail=50 airflow-scheduler || true
+              echo "--- All registered DAGs ---"
+              curl -sf -u ${AIRFLOW_ADMIN_USER}:${AIRFLOW_ADMIN_PASSWORD} \
+                http://localhost:8080/api/v1/dags 2>/dev/null || true
+              exit 1
+            fi
+            echo "  attempt $i/30 — not yet registered, sleeping 10s"
+            sleep 10
+          done
+
+          echo "Unpausing DAGs..."
+          curl -sf -u ${AIRFLOW_ADMIN_USER}:${AIRFLOW_ADMIN_PASSWORD} \
+            -X PATCH http://localhost:8080/api/v1/dags/sales_pipeline \
+            -H "Content-Type: application/json" \
+            -d '{"is_paused": false}' > /dev/null
+          curl -sf -u ${AIRFLOW_ADMIN_USER}:${AIRFLOW_ADMIN_PASSWORD} \
+            -X PATCH http://localhost:8080/api/v1/dags/data_flow_validation \
+            -H "Content-Type: application/json" \
+            -d '{"is_paused": false}' > /dev/null
+          echo "DAGs unpaused and ready"
 
       # ── Trigger sales_pipeline and poll ─────────────────────────────────
       - name: Trigger sales_pipeline and wait
