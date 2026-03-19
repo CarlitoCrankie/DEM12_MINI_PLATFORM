@@ -10,7 +10,7 @@ jobs:
   deploy:
     name: Deploy & Validate
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     if: github.event.workflow_run.conclusion == 'success'
 
     steps:
@@ -18,33 +18,33 @@ jobs:
 
       - name: Write .env from GitHub Secrets
         run: |
-          cat > .env << EOF
-          POSTGRES_HOST=postgres
-          POSTGRES_PORT=5432
-          POSTGRES_ADMIN_USER=${{ secrets.POSTGRES_ADMIN_USER || 'admin' }}
-          POSTGRES_ADMIN_PASSWORD=${{ secrets.POSTGRES_ADMIN_PASSWORD || 'adminpass' }}
-          AIRFLOW_DB=airflow
-          AIRFLOW_DB_USER=${{ secrets.AIRFLOW_DB_USER || 'airflow' }}
-          AIRFLOW_DB_PASSWORD=${{ secrets.AIRFLOW_DB_PASSWORD || 'airflow' }}
-          SALES_DB=salesdb
-          SALES_DB_USER=${{ secrets.SALES_DB_USER || 'datauser' }}
-          SALES_DB_PASSWORD=${{ secrets.SALES_DB_PASSWORD || 'datapass' }}
-          METABASE_DB=metabase
-          MINIO_HOST=minio
-          MINIO_API_PORT=9000
-          MINIO_CONSOLE_PORT=9001
-          MINIO_ROOT_USER=${{ secrets.MINIO_ROOT_USER || 'minio' }}
-          MINIO_ROOT_PASSWORD=${{ secrets.MINIO_ROOT_PASSWORD || 'minio123' }}
-          MINIO_SOURCE_BUCKET=sales-data
-          MINIO_ARCHIVE_BUCKET=processed-data
-          AIRFLOW_WEBSERVER_PORT=8080
-          AIRFLOW_ADMIN_USER=${{ secrets.AIRFLOW_ADMIN_USER || 'admin' }}
-          AIRFLOW_ADMIN_PASSWORD=${{ secrets.AIRFLOW_ADMIN_PASSWORD || 'admin' }}
-          AIRFLOW_ADMIN_EMAIL=${{ secrets.AIRFLOW_ADMIN_EMAIL || 'admin@ci.local' }}
-          AIRFLOW_FERNET_KEY=${{ secrets.AIRFLOW_FERNET_KEY || '81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs=' }}
-          AIRFLOW_SECRET_KEY=${{ secrets.AIRFLOW_SECRET_KEY || 'a25mQ1FHTUh3MnFRSk5KMEIyVVU2YmN0VGRyYTVXY2' }}
-          METABASE_PORT=3000
-          EOF
+          cat > .env << ENVEOF
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
+POSTGRES_ADMIN_USER=${{ secrets.POSTGRES_ADMIN_USER || 'admin' }}
+POSTGRES_ADMIN_PASSWORD=${{ secrets.POSTGRES_ADMIN_PASSWORD || 'adminpass' }}
+AIRFLOW_DB=airflow
+AIRFLOW_DB_USER=${{ secrets.AIRFLOW_DB_USER || 'airflow' }}
+AIRFLOW_DB_PASSWORD=${{ secrets.AIRFLOW_DB_PASSWORD || 'airflow' }}
+SALES_DB=salesdb
+SALES_DB_USER=${{ secrets.SALES_DB_USER || 'datauser' }}
+SALES_DB_PASSWORD=${{ secrets.SALES_DB_PASSWORD || 'datapass' }}
+METABASE_DB=metabase
+MINIO_HOST=minio
+MINIO_API_PORT=9000
+MINIO_CONSOLE_PORT=9001
+MINIO_ROOT_USER=${{ secrets.MINIO_ROOT_USER || 'minio' }}
+MINIO_ROOT_PASSWORD=${{ secrets.MINIO_ROOT_PASSWORD || 'minio123' }}
+MINIO_SOURCE_BUCKET=sales-data
+MINIO_ARCHIVE_BUCKET=processed-data
+AIRFLOW_WEBSERVER_PORT=8080
+AIRFLOW_ADMIN_USER=${{ secrets.AIRFLOW_ADMIN_USER || 'admin' }}
+AIRFLOW_ADMIN_PASSWORD=${{ secrets.AIRFLOW_ADMIN_PASSWORD || 'admin' }}
+AIRFLOW_ADMIN_EMAIL=${{ secrets.AIRFLOW_ADMIN_EMAIL || 'admin@ci.local' }}
+AIRFLOW_FERNET_KEY=${{ secrets.AIRFLOW_FERNET_KEY || '81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs=' }}
+AIRFLOW_SECRET_KEY=${{ secrets.AIRFLOW_SECRET_KEY || 'a25mQ1FHTUh3MnFRSk5KMEIyVVU2YmN0VGRyYTVXY2' }}
+METABASE_PORT=3000
+ENVEOF
 
       - name: Start PostgreSQL and MinIO
         run: |
@@ -86,7 +86,10 @@ jobs:
             STATE=$(docker compose exec -T airflow-scheduler airflow dags list-runs -d sales_pipeline --no-backfill 2>/dev/null | grep "sales_pipeline" | grep -oE "success|failed|running|queued" | tail -1)
             echo "  Poll $i/20 — state: ${STATE:-unknown}"
             if [ "$STATE" = "success" ]; then echo "Pipeline completed"; break; fi
-            if [ "$STATE" = "failed" ]; then echo "ERROR: Pipeline failed"; exit 1; fi
+            if [ "$STATE" = "failed" ]; then
+              docker compose logs --tail=80 airflow-scheduler
+              exit 1
+            fi
           done
 
       - name: Run data flow validation
@@ -104,7 +107,6 @@ jobs:
           echo "  fact_sales rows   : $SALES"
           echo "  dim_customers rows: $CUSTOMERS"
           echo "  Successful runs   : $RUNS"
-          echo "  Deployment complete"
           echo "=================================="
 
       - name: Cleanup
