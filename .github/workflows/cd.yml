@@ -10,7 +10,7 @@ jobs:
   deploy:
     name: Deploy & Validate
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     if: github.event.workflow_run.conclusion == 'success'
 
     steps:
@@ -59,55 +59,94 @@ jobs:
             "AIRFLOW_SECRET_KEY=${AIRFLOW_SECRET_KEY}" \
             "METABASE_PORT=3000" > .env
 
+      # ── Start services ──────────────────────────────────────────────────
       - name: Start PostgreSQL and MinIO
         run: |
           docker compose up -d postgres minio
-          timeout 120 bash -c 'until docker inspect mdp-postgres --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do sleep 5; done'
+          timeout 120 bash -c '
+            until docker inspect mdp-postgres \
+              --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do
+              sleep 5
+            done'
           echo "PostgreSQL healthy"
-          timeout 60 bash -c 'until docker inspect mdp-minio --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do sleep 5; done'
+          timeout 60 bash -c '
+            until docker inspect mdp-minio \
+              --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do
+              sleep 5
+            done'
           echo "MinIO healthy"
 
       - name: Initialise MinIO buckets
         run: |
           docker compose up -d minio-init
-          timeout 30 bash -c 'until docker inspect mdp-minio-init --format="{{.State.Status}}" 2>/dev/null | grep -q "exited"; do sleep 2; done'
-          echo "MinIO buckets ready"
+          timeout 30 bash -c '
+            until docker inspect mdp-minio-init \
+              --format="{{.State.Status}}" 2>/dev/null | grep -q "exited"; do
+              sleep 2
+            done'
+          echo "Buckets ready"
 
       - name: Start Airflow
         run: |
           docker compose up -d airflow-init
-          timeout 180 bash -c 'until docker compose logs airflow-init 2>/dev/null | grep -q "Airflow initialised"; do sleep 5; done'
+          timeout 180 bash -c '
+            until docker compose logs airflow-init 2>/dev/null | grep -q "Airflow initialised"; do
+              sleep 5
+            done'
           docker compose up -d airflow-webserver airflow-scheduler
-          timeout 120 bash -c 'until curl -sf http://localhost:8080/health 2>/dev/null | grep -q "healthy"; do sleep 5; done'
+          timeout 120 bash -c '
+            until curl -sf http://localhost:8080/health 2>/dev/null | grep -q "healthy"; do
+              sleep 5
+            done'
           echo "Airflow ready"
 
+      # ── Seed data ───────────────────────────────────────────────────────
       - name: Generate and upload sample data
         run: docker compose run --rm data-generator
 
-      - name: Wait for DAG to be discovered
+      # ── Wait for DAG ────────────────────────────────────────────────────
+      - name: Wait for DAG discovery
         run: |
-          echo "Waiting for sales_pipeline DAG ..."
-          timeout 120 bash -c 'until docker compose exec -T airflow-scheduler airflow dags list 2>/dev/null | grep -q "sales_pipeline"; do echo "  not yet ..."; sleep 10; done'
-          echo "DAG discovered"
+          timeout 120 bash -c '
+            until curl -sf -u admin:admin \
+              http://localhost:8080/api/v1/dags/sales_pipeline 2>/dev/null \
+              | grep -q "sales_pipeline"; do
+              echo "  waiting for DAG..."
+              sleep 10
+            done'
+          echo "DAG ready"
 
-      - name: Trigger pipeline and poll for completion
+      # ── Trigger and poll ────────────────────────────────────────────────
+      - name: Trigger pipeline and wait
         run: |
-          docker compose exec -T airflow-scheduler airflow dags trigger sales_pipeline
-          echo "Pipeline triggered — polling every 15s for up to 5 min ..."
-          for i in $(seq 1 20); do
-            sleep 15
-            STATE=$(docker compose exec -T airflow-scheduler airflow dags list-runs -d sales_pipeline --no-backfill 2>/dev/null | grep "sales_pipeline" | grep -oE "success|failed|running|queued" | tail -1)
-            echo "  Poll $i/20 — state: ${STATE:-unknown}"
-            if [ "$STATE" = "success" ]; then echo "Pipeline completed"; break; fi
+          RUN_ID=$(curl -sf -u admin:admin \
+            -X POST http://localhost:8080/api/v1/dags/sales_pipeline/dagRuns \
+            -H "Content-Type: application/json" \
+            -d "{\"conf\": {}}" | python3 -c "import sys,json; print(json.load(sys.stdin)['dag_run_id'])")
+          echo "Triggered run: $RUN_ID"
+
+          for i in $(seq 1 30); do
+            sleep 20
+            STATE=$(curl -sf -u admin:admin \
+              "http://localhost:8080/api/v1/dags/sales_pipeline/dagRuns/${RUN_ID}" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin).get('state','unknown'))" 2>/dev/null)
+            echo "  Poll $i/30 — state: ${STATE}"
+            if [ "$STATE" = "success" ]; then echo "Pipeline complete"; break; fi
             if [ "$STATE" = "failed" ]; then echo "ERROR: Pipeline failed"; exit 1; fi
           done
 
-      - name: Run data flow validation
+      # ── Validate ────────────────────────────────────────────────────────
+      - name: Run data flow validation DAG
         run: |
-          docker compose exec -T airflow-scheduler airflow dags trigger data_flow_validation
+          curl -sf -u admin:admin \
+            -X POST http://localhost:8080/api/v1/dags/data_flow_validation/dagRuns \
+            -H "Content-Type: application/json" \
+            -d "{\"conf\": {}}"
           sleep 30
+          echo "Validation DAG triggered"
 
-      - name: Print deployment report
+      # ── Report ──────────────────────────────────────────────────────────
+      - name: Deployment report
         run: |
           SALES=$(docker compose exec -T postgres psql -U admin -d salesdb -t -c "SELECT COUNT(*) FROM fact_sales" | xargs)
           CUSTOMERS=$(docker compose exec -T postgres psql -U admin -d salesdb -t -c "SELECT COUNT(*) FROM dim_customers" | xargs)

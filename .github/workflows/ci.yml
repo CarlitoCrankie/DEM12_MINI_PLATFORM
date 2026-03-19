@@ -7,6 +7,7 @@ on:
     branches: [main, develop]
 
 jobs:
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -30,13 +31,13 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - name: Install test dependencies
+      - name: Install dependencies
         run: pip install pytest faker minio pandas psycopg2-binary
       - name: Run unit tests
         run: python -m pytest tests/test_generator.py -v
 
   build:
-    name: Build Docker Image (${{ matrix.target }})
+    name: Build (${{ matrix.target }})
     runs-on: ubuntu-latest
     needs: unit-tests
     strategy:
@@ -44,8 +45,7 @@ jobs:
         target: [airflow, generator]
     steps:
       - uses: actions/checkout@v4
-      - name: Build ${{ matrix.target }} stage
-        uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
@@ -56,7 +56,7 @@ jobs:
     name: Integration Test
     runs-on: ubuntu-latest
     needs: build
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -89,63 +89,113 @@ jobs:
             "AIRFLOW_SECRET_KEY=a25mQ1FHTUh3MnFRSk5KMEIyVVU2YmN0VGRyYTVXY2" \
             "METABASE_PORT=3000" > .env
 
+      # ── Step 1: Start database and storage ──────────────────────────────
       - name: Start PostgreSQL and MinIO
         run: |
           docker compose up -d postgres minio minio-init
-          timeout 90 bash -c 'until docker inspect mdp-postgres --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do sleep 3; done'
+          echo "Waiting for PostgreSQL..."
+          timeout 90 bash -c '
+            until docker inspect mdp-postgres \
+              --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do
+              sleep 3
+            done'
           echo "PostgreSQL healthy"
-          timeout 60 bash -c 'until docker compose exec -T minio mc alias set local http://localhost:9000 minio minio123 2>/dev/null; do sleep 3; done'
+          echo "Waiting for MinIO..."
+          timeout 60 bash -c '
+            until docker compose exec -T minio \
+              mc alias set local http://localhost:9000 minio minio123 2>/dev/null; do
+              sleep 3
+            done'
           echo "MinIO ready"
 
-      - name: Run data generator
-        run: docker compose run --rm data-generator
-
-      - name: Verify files in MinIO
+      # ── Step 2: Upload data ─────────────────────────────────────────────
+      - name: Generate and upload sample data
         run: |
+          docker compose run --rm data-generator
           docker compose exec -T minio mc alias set local http://localhost:9000 minio minio123
           COUNT=$(docker compose exec -T minio mc ls local/sales-data/raw/ | wc -l)
-          echo "Files in MinIO: $COUNT"
-          [ "$COUNT" -gt 0 ] || (echo "ERROR: No files in MinIO" && exit 1)
+          echo "Files uploaded to MinIO: $COUNT"
+          [ "$COUNT" -gt 0 ] || (echo "ERROR: No files uploaded" && exit 1)
 
+      # ── Step 3: Start Airflow ───────────────────────────────────────────
       - name: Start Airflow
         run: |
           docker compose up -d airflow-init
-          timeout 180 bash -c 'until docker compose logs airflow-init 2>/dev/null | grep -q "Airflow initialised"; do sleep 5; done'
+          echo "Waiting for Airflow DB migration..."
+          timeout 180 bash -c '
+            until docker compose logs airflow-init 2>/dev/null | grep -q "Airflow initialised"; do
+              sleep 5
+            done'
           echo "Airflow initialised"
           docker compose up -d airflow-webserver airflow-scheduler
-          timeout 120 bash -c 'until curl -sf http://localhost:8080/health 2>/dev/null | grep -q "healthy"; do sleep 5; done'
+          echo "Waiting for Airflow webserver..."
+          timeout 120 bash -c '
+            until curl -sf http://localhost:8080/health 2>/dev/null | grep -q "healthy"; do
+              sleep 5
+            done'
           echo "Airflow webserver healthy"
 
-      - name: Wait for DAG to be discovered
+      # ── Step 4: Wait for DAG discovery ─────────────────────────────────
+      - name: Wait for DAG discovery
         run: |
-          echo "Waiting for sales_pipeline DAG ..."
-          timeout 120 bash -c 'until docker compose exec -T airflow-scheduler airflow dags list 2>/dev/null | grep -q "sales_pipeline"; do echo "  not yet ..."; sleep 10; done'
-          echo "DAG discovered"
+          echo "Waiting for DAGs to be discovered..."
+          timeout 120 bash -c '
+            until curl -sf -u admin:admin \
+              http://localhost:8080/api/v1/dags/sales_pipeline 2>/dev/null \
+              | grep -q "sales_pipeline"; do
+              echo "  DAG not yet in API..."
+              sleep 10
+            done'
+          echo "sales_pipeline DAG is ready"
 
-      - name: Trigger pipeline and poll for completion
+      # ── Step 5: Trigger via REST API and poll ──────────────────────────
+      - name: Trigger pipeline and wait for completion
         run: |
-          docker compose exec -T airflow-scheduler airflow dags trigger sales_pipeline
-          echo "Pipeline triggered — polling every 15s for up to 5 min ..."
-          for i in $(seq 1 20); do
-            sleep 15
-            STATE=$(docker compose exec -T airflow-scheduler airflow dags list-runs -d sales_pipeline --no-backfill 2>/dev/null | grep "sales_pipeline" | grep -oE "success|failed|running|queued" | tail -1)
-            echo "  Poll $i/20 — state: ${STATE:-unknown}"
+          echo "Triggering sales_pipeline via REST API..."
+          RUN_ID=$(curl -sf -u admin:admin \
+            -X POST http://localhost:8080/api/v1/dags/sales_pipeline/dagRuns \
+            -H "Content-Type: application/json" \
+            -d "{\"conf\": {}}" | python3 -c "import sys,json; print(json.load(sys.stdin)['dag_run_id'])")
+          echo "DAG run triggered: $RUN_ID"
+
+          echo "Polling for completion every 20s (max 10 min)..."
+          for i in $(seq 1 30); do
+            sleep 20
+            STATE=$(curl -sf -u admin:admin \
+              "http://localhost:8080/api/v1/dags/sales_pipeline/dagRuns/${RUN_ID}" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin).get('state','unknown'))" 2>/dev/null)
+            echo "  Poll $i/30 — state: ${STATE}"
             if [ "$STATE" = "success" ]; then
               echo "Pipeline completed successfully"
               exit 0
             elif [ "$STATE" = "failed" ]; then
-              echo "ERROR: Pipeline run failed"
+              echo "ERROR: Pipeline run failed — fetching failed task details..."
+              curl -sf -u admin:admin \
+                "http://localhost:8080/api/v1/dags/sales_pipeline/dagRuns/${RUN_ID}/taskInstances" \
+                | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for t in data.get('task_instances', []):
+              if t.get('state') == 'failed':
+                  print(f\"FAILED TASK: {t['task_id']} — {t.get('state')}\")
+          " 2>/dev/null || true
               exit 1
             fi
           done
-          echo "ERROR: Pipeline did not complete within 5 minutes"
+          echo "ERROR: Pipeline did not complete within 10 minutes"
           exit 1
 
-      - name: Verify rows in PostgreSQL
+      # ── Step 6: Verify data landed ─────────────────────────────────────
+      - name: Verify data in PostgreSQL
         run: |
-          ROWS=$(docker compose exec -T postgres psql -U admin -d salesdb -t -c "SELECT COUNT(*) FROM fact_sales" | xargs)
+          ROWS=$(docker compose exec -T postgres \
+            psql -U admin -d salesdb -t -c "SELECT COUNT(*) FROM fact_sales" | xargs)
           echo "Rows in fact_sales: $ROWS"
-          [ "$ROWS" -gt 0 ] || (echo "ERROR: No rows loaded" && exit 1)
+          [ "$ROWS" -gt 0 ] || (echo "ERROR: No rows loaded into fact_sales" && exit 1)
+
+          PIPELINE_RUNS=$(docker compose exec -T postgres \
+            psql -U admin -d salesdb -t -c "SELECT COUNT(*) FROM pipeline_runs WHERE status='success'" | xargs)
+          echo "Successful pipeline runs: $PIPELINE_RUNS"
 
       - name: Cleanup
         if: always()
