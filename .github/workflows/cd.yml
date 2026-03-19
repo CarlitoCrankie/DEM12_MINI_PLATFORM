@@ -1,164 +1,428 @@
-name: CD — Deploy to Test Environment
+# ──────────────────────────────────────────────────────────────────────────────
+#  Mini Data Platform — Continuous Deployment
+#
+#  Triggered on every push / merge to main.
+#
+#  What this does:
+#    1.  Write .env from GitHub Secrets
+#    2.  Start PostgreSQL + MinIO and wait for healthy status
+#    3.  Initialise MinIO buckets via minio-init
+#    4.  Start + initialise Airflow (webserver + scheduler)
+#    5.  Run data generator — seeds MinIO raw/ with 13 CSV files
+#    6.  Trigger sales_pipeline DAG and poll until success
+#    7.  Trigger data_flow_validation DAG and poll until success
+#    8.  Print end-to-end metrics report
+#    9.  Tear down the full environment
+#
+#  Required GitHub Secrets (Settings → Secrets → Actions):
+#    POSTGRES_ADMIN_USER       POSTGRES_ADMIN_PASSWORD
+#    SALES_DB_USER             SALES_DB_PASSWORD
+#    MINIO_ROOT_USER           MINIO_ROOT_PASSWORD
+#    AIRFLOW_FERNET_KEY        AIRFLOW_SECRET_KEY
+#    AIRFLOW_ADMIN_USER        AIRFLOW_ADMIN_PASSWORD   AIRFLOW_ADMIN_EMAIL
+#
+#  All other values below use safe, non-secret defaults for the CI environment.
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: CD
 
 on:
-  workflow_run:
-    workflows: ["CI — Build & Test"]
-    types: [completed]
+  push:
     branches: [main]
 
-jobs:
-  deploy:
-    name: Deploy & Validate
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: github.event.workflow_run.conclusion == 'success'
+# Only one CD run at a time — queue, don't cancel, to preserve audit logs
+concurrency:
+  group: cd-main
+  cancel-in-progress: false
 
+env:
+  PYTHON_VERSION: "3.11"
+  AIRFLOW_WEBSERVER_PORT: "8080"
+  AIRFLOW_BASE_URL: "http://localhost:8080"
+
+jobs:
+  deploy-and-validate:
+    name: Full Stack Deploy + End-to-End Validation
+    runs-on: ubuntu-latest
+
+    # ── Step 1: Write .env from secrets ───────────────────────────────────────
     steps:
       - uses: actions/checkout@v4
 
       - name: Write .env from GitHub Secrets
         env:
-          POSTGRES_ADMIN_USER: ${{ secrets.POSTGRES_ADMIN_USER || 'admin' }}
-          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD || 'adminpass' }}
-          AIRFLOW_DB_USER: ${{ secrets.AIRFLOW_DB_USER || 'airflow' }}
-          AIRFLOW_DB_PASSWORD: ${{ secrets.AIRFLOW_DB_PASSWORD || 'airflow' }}
-          SALES_DB_USER: ${{ secrets.SALES_DB_USER || 'datauser' }}
-          SALES_DB_PASSWORD: ${{ secrets.SALES_DB_PASSWORD || 'datapass' }}
-          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER || 'minio' }}
-          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD || 'minio123' }}
-          AIRFLOW_ADMIN_USER: ${{ secrets.AIRFLOW_ADMIN_USER || 'admin' }}
-          AIRFLOW_ADMIN_PASSWORD: ${{ secrets.AIRFLOW_ADMIN_PASSWORD || 'admin' }}
-          AIRFLOW_ADMIN_EMAIL: ${{ secrets.AIRFLOW_ADMIN_EMAIL || 'admin@ci.local' }}
-          AIRFLOW_FERNET_KEY: ${{ secrets.AIRFLOW_FERNET_KEY || '81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs=' }}
-          AIRFLOW_SECRET_KEY: ${{ secrets.AIRFLOW_SECRET_KEY || 'a25mQ1FHTUh3MnFRSk5KMEIyVVU2YmN0VGRyYTVXY2' }}
+          POSTGRES_ADMIN_USER: ${{ secrets.POSTGRES_ADMIN_USER }}
+          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+          SALES_DB_USER: ${{ secrets.SALES_DB_USER }}
+          SALES_DB_PASSWORD: ${{ secrets.SALES_DB_PASSWORD }}
+          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
+          AIRFLOW_FERNET_KEY: ${{ secrets.AIRFLOW_FERNET_KEY }}
+          AIRFLOW_SECRET_KEY: ${{ secrets.AIRFLOW_SECRET_KEY }}
+          AIRFLOW_ADMIN_USER: ${{ secrets.AIRFLOW_ADMIN_USER }}
+          AIRFLOW_ADMIN_PASSWORD: ${{ secrets.AIRFLOW_ADMIN_PASSWORD }}
+          AIRFLOW_ADMIN_EMAIL: ${{ secrets.AIRFLOW_ADMIN_EMAIL }}
         run: |
-          printf '%s\n' \
-            "POSTGRES_HOST=postgres" \
-            "POSTGRES_PORT=5432" \
-            "POSTGRES_ADMIN_USER=${POSTGRES_ADMIN_USER}" \
-            "POSTGRES_ADMIN_PASSWORD=${POSTGRES_ADMIN_PASSWORD}" \
-            "AIRFLOW_DB=airflow" \
-            "AIRFLOW_DB_USER=${AIRFLOW_DB_USER}" \
-            "AIRFLOW_DB_PASSWORD=${AIRFLOW_DB_PASSWORD}" \
-            "SALES_DB=salesdb" \
-            "SALES_DB_USER=${SALES_DB_USER}" \
-            "SALES_DB_PASSWORD=${SALES_DB_PASSWORD}" \
-            "METABASE_DB=metabase" \
-            "MINIO_HOST=minio" \
-            "MINIO_API_PORT=9000" \
-            "MINIO_CONSOLE_PORT=9001" \
-            "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
-            "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
-            "MINIO_SOURCE_BUCKET=sales-data" \
-            "MINIO_ARCHIVE_BUCKET=processed-data" \
-            "AIRFLOW_WEBSERVER_PORT=8080" \
-            "AIRFLOW_ADMIN_USER=${AIRFLOW_ADMIN_USER}" \
-            "AIRFLOW_ADMIN_PASSWORD=${AIRFLOW_ADMIN_PASSWORD}" \
-            "AIRFLOW_ADMIN_EMAIL=${AIRFLOW_ADMIN_EMAIL}" \
-            "AIRFLOW_FERNET_KEY=${AIRFLOW_FERNET_KEY}" \
-            "AIRFLOW_SECRET_KEY=${AIRFLOW_SECRET_KEY}" \
-            "METABASE_PORT=3000" > .env
+          # Secrets fall back to safe defaults if not set (allows fork runs)
+          cat > .env << EOF
+          # ── PostgreSQL ──────────────────────────────────────────────────────
+          POSTGRES_ADMIN_USER=${POSTGRES_ADMIN_USER:-admin}
+          POSTGRES_ADMIN_PASSWORD=${POSTGRES_ADMIN_PASSWORD:-adminpass}
+          POSTGRES_HOST=postgres
+          POSTGRES_PORT=5432
 
-      # ── Start services ──────────────────────────────────────────────────
+          # ── Sales DB ────────────────────────────────────────────────────────
+          SALES_DB=salesdb
+          SALES_DB_USER=${SALES_DB_USER:-datauser}
+          SALES_DB_PASSWORD=${SALES_DB_PASSWORD:-datapass}
+
+          # ── MinIO ───────────────────────────────────────────────────────────
+          MINIO_HOST=minio
+          MINIO_ROOT_USER=${MINIO_ROOT_USER:-minio}
+          MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minio123}
+          MINIO_API_PORT=9000
+          MINIO_CONSOLE_PORT=9001
+          MINIO_SOURCE_BUCKET=sales-data
+          MINIO_ARCHIVE_BUCKET=processed-data
+
+          # ── Airflow ─────────────────────────────────────────────────────────
+          AIRFLOW_FERNET_KEY=${AIRFLOW_FERNET_KEY:-81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs=}
+          AIRFLOW_SECRET_KEY=${AIRFLOW_SECRET_KEY:-cd-secret-key}
+          AIRFLOW_DB_USER=airflow
+          AIRFLOW_DB_PASSWORD=airflow
+          AIRFLOW_DB=airflow
+          AIRFLOW_ADMIN_USER=${AIRFLOW_ADMIN_USER:-admin}
+          AIRFLOW_ADMIN_EMAIL=${AIRFLOW_ADMIN_EMAIL:-admin@mdp.local}
+          AIRFLOW_ADMIN_PASSWORD=${AIRFLOW_ADMIN_PASSWORD:-admin}
+          AIRFLOW_WEBSERVER_PORT=8080
+
+          # ── Metabase ────────────────────────────────────────────────────────
+          METABASE_DB=metabase
+          METABASE_PORT=3000
+          EOF
+          echo "✅  .env written"
+
+      # ── Step 2: Start infra — PostgreSQL + MinIO ──────────────────────────
       - name: Start PostgreSQL and MinIO
         run: |
           docker compose up -d postgres minio
-          timeout 120 bash -c '
-            until docker inspect mdp-postgres \
-              --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do
-              sleep 5
-            done'
-          echo "PostgreSQL healthy"
-          timeout 60 bash -c '
-            until docker inspect mdp-minio \
-              --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do
-              sleep 5
-            done'
-          echo "MinIO healthy"
+          echo "Services started — waiting for health checks..."
 
+      - name: Wait for PostgreSQL
+        run: |
+          echo "Polling PostgreSQL..."
+          for i in $(seq 1 40); do
+            docker compose exec -T postgres pg_isready -U admin -d postgres 2>/dev/null && break
+            echo "  $i/40 — not ready, sleeping 4s"
+            sleep 4
+          done
+          docker compose exec -T postgres pg_isready -U admin -d postgres \
+            || { echo "::error::PostgreSQL failed to become healthy"; docker compose logs postgres; exit 1; }
+          echo "✅  PostgreSQL healthy"
+
+      - name: Wait for MinIO
+        run: |
+          echo "Polling MinIO..."
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && break
+            echo "  $i/30 — not ready, sleeping 4s"
+            sleep 4
+          done
+          curl -sf http://localhost:9000/minio/health/live \
+            || { echo "::error::MinIO failed to become healthy"; docker compose logs minio; exit 1; }
+          echo "✅  MinIO healthy"
+
+      # ── Step 3: Initialise MinIO buckets ─────────────────────────────────
       - name: Initialise MinIO buckets
         run: |
           docker compose up -d minio-init
-          timeout 30 bash -c '
-            until docker inspect mdp-minio-init \
-              --format="{{.State.Status}}" 2>/dev/null | grep -q "exited"; do
-              sleep 2
-            done'
-          echo "Buckets ready"
+          docker compose wait minio-init
+          EXIT=$(docker compose ps minio-init --format json | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d.get('ExitCode',0))" 2>/dev/null || echo 0)
+          if [ "$EXIT" != "0" ]; then
+            echo "::error::minio-init exited with code $EXIT"
+            docker compose logs minio-init
+            exit 1
+          fi
+          echo "✅  MinIO buckets ready"
+          docker compose logs minio-init
 
-      - name: Start Airflow
+      # ── Step 4: Start Airflow ─────────────────────────────────────────────
+      - name: Initialise Airflow database
         run: |
           docker compose up -d airflow-init
-          timeout 180 bash -c '
-            until docker compose logs airflow-init 2>/dev/null | grep -q "Airflow initialised"; do
-              sleep 5
-            done'
-          docker compose up -d airflow-webserver airflow-scheduler
-          timeout 120 bash -c '
-            until curl -sf http://localhost:8080/health 2>/dev/null | grep -q "healthy"; do
-              sleep 5
-            done'
-          echo "Airflow ready"
-
-      # ── Seed data ───────────────────────────────────────────────────────
-      - name: Generate and upload sample data
-        run: docker compose run --rm data-generator
-
-      # ── Wait for DAG ────────────────────────────────────────────────────
-      - name: Wait for DAG discovery
-        run: |
-          timeout 120 bash -c '
-            until curl -sf -u admin:admin \
-              http://localhost:8080/api/v1/dags/sales_pipeline 2>/dev/null \
-              | grep -q "sales_pipeline"; do
-              echo "  waiting for DAG..."
-              sleep 10
-            done'
-          echo "DAG ready"
-
-      # ── Trigger and poll ────────────────────────────────────────────────
-      - name: Trigger pipeline and wait
-        run: |
-          RUN_ID=$(curl -sf -u admin:admin \
-            -X POST http://localhost:8080/api/v1/dags/sales_pipeline/dagRuns \
-            -H "Content-Type: application/json" \
-            -d "{\"conf\": {}}" | python3 -c "import sys,json; print(json.load(sys.stdin)['dag_run_id'])")
-          echo "Triggered run: $RUN_ID"
-
-          for i in $(seq 1 30); do
-            sleep 20
-            STATE=$(curl -sf -u admin:admin \
-              "http://localhost:8080/api/v1/dags/sales_pipeline/dagRuns/${RUN_ID}" \
-              | python3 -c "import sys,json; print(json.load(sys.stdin).get('state','unknown'))" 2>/dev/null)
-            echo "  Poll $i/30 — state: ${STATE}"
-            if [ "$STATE" = "success" ]; then echo "Pipeline complete"; break; fi
-            if [ "$STATE" = "failed" ]; then echo "ERROR: Pipeline failed"; exit 1; fi
+          echo "Waiting for airflow-init to complete..."
+          # Poll until the init container exits
+          for i in $(seq 1 60); do
+            STATUS=$(docker inspect --format='{{.State.Status}}' mdp-airflow-init 2>/dev/null || echo "missing")
+            if [ "$STATUS" = "exited" ]; then
+              EXIT_CODE=$(docker inspect --format='{{.State.ExitCode}}' mdp-airflow-init)
+              if [ "$EXIT_CODE" = "0" ]; then
+                echo "✅  Airflow DB initialised"
+                break
+              else
+                echo "::error::airflow-init exited with code $EXIT_CODE"
+                docker compose logs airflow-init
+                exit 1
+              fi
+            fi
+            echo "  $i/60 — status=$STATUS, sleeping 5s"
+            sleep 5
           done
 
-      # ── Validate ────────────────────────────────────────────────────────
-      - name: Run data flow validation DAG
+      - name: Start Airflow webserver and scheduler
         run: |
-          curl -sf -u admin:admin \
-            -X POST http://localhost:8080/api/v1/dags/data_flow_validation/dagRuns \
-            -H "Content-Type: application/json" \
-            -d "{\"conf\": {}}"
-          sleep 30
-          echo "Validation DAG triggered"
+          docker compose up -d airflow-webserver airflow-scheduler
+          echo "Airflow services started"
 
-      # ── Report ──────────────────────────────────────────────────────────
-      - name: Deployment report
+      - name: Wait for Airflow webserver to be healthy
         run: |
-          SALES=$(docker compose exec -T postgres psql -U admin -d salesdb -t -c "SELECT COUNT(*) FROM fact_sales" | xargs)
-          CUSTOMERS=$(docker compose exec -T postgres psql -U admin -d salesdb -t -c "SELECT COUNT(*) FROM dim_customers" | xargs)
-          RUNS=$(docker compose exec -T postgres psql -U admin -d salesdb -t -c "SELECT COUNT(*) FROM pipeline_runs WHERE status='success'" | xargs)
-          echo "=================================="
-          echo "  DEPLOYMENT REPORT"
-          echo "  fact_sales rows   : $SALES"
-          echo "  dim_customers rows: $CUSTOMERS"
-          echo "  Successful runs   : $RUNS"
-          echo "  Deployment complete"
-          echo "=================================="
+          echo "Polling Airflow webserver..."
+          for i in $(seq 1 40); do
+            STATUS=$(curl -sf http://localhost:8080/health 2>/dev/null | python3 -c \
+              "import sys,json; d=json.load(sys.stdin); print(d.get('metadatabase',{}).get('status','unknown'))" \
+              2>/dev/null || echo "down")
+            if [ "$STATUS" = "healthy" ]; then
+              echo "✅  Airflow webserver healthy (attempt $i)"
+              break
+            fi
+            echo "  $i/40 — status=$STATUS, sleeping 6s"
+            sleep 6
+          done
+          curl -sf http://localhost:8080/health \
+            || { echo "::error::Airflow webserver not healthy"; docker compose logs airflow-webserver; exit 1; }
 
-      - name: Cleanup
+      # Give the scheduler time to parse DAGs before we trigger them
+      - name: Wait for DAGs to be registered
+        run: |
+          AF_USER="${{ secrets.AIRFLOW_ADMIN_USER || 'admin' }}"
+          AF_PASS="${{ secrets.AIRFLOW_ADMIN_PASSWORD || 'admin' }}"
+          echo "Waiting for DAGs to appear in Airflow..."
+          for i in $(seq 1 30); do
+            DAGS=$(curl -sf -u "$AF_USER:$AF_PASS" \
+              http://localhost:8080/api/v1/dags 2>/dev/null | \
+              python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('dags',[])))" \
+              2>/dev/null || echo 0)
+            if [ "$DAGS" -ge 2 ] 2>/dev/null; then
+              echo "✅  $DAGS DAG(s) registered"
+              break
+            fi
+            echo "  $i/30 — $DAGS DAG(s) found, sleeping 5s"
+            sleep 5
+          done
+
+      # ── Step 5: Run data generator ────────────────────────────────────────
+      - name: Run data generator
+        run: |
+          docker compose run --rm data-generator
+          echo "Verifying files in MinIO..."
+          FILE_COUNT=$(docker compose exec -T minio \
+            sh -c 'mc alias set local http://localhost:9000 minio minio123 >/dev/null 2>&1 && \
+                   mc ls local/sales-data/raw/ 2>/dev/null | wc -l' || echo 0)
+          echo "Files in raw/: $FILE_COUNT"
+          [ "$FILE_COUNT" -gt 0 ] \
+            || { echo "::error::No files found in MinIO after generator run"; exit 1; }
+          echo "✅  Data generator seeded $FILE_COUNT file(s)"
+
+      # ── Step 6: Trigger and wait for sales_pipeline ───────────────────────
+      - name: Trigger sales_pipeline DAG
+        env:
+          AF_USER: ${{ secrets.AIRFLOW_ADMIN_USER || 'admin' }}
+          AF_PASS: ${{ secrets.AIRFLOW_ADMIN_PASSWORD || 'admin' }}
+        run: |
+          AF_USER="${AF_USER:-admin}"
+          AF_PASS="${AF_PASS:-admin}"
+
+          RUN_ID=$(python3 -c "
+          import urllib.request, json, base64, time
+
+          creds = base64.b64encode(b'${AF_USER}:${AF_PASS}').decode()
+          headers = {
+              'Content-Type': 'application/json',
+              'Authorization': f'Basic {creds}'
+          }
+          body = json.dumps({'conf': {}}).encode()
+          req = urllib.request.Request(
+              'http://localhost:8080/api/v1/dags/sales_pipeline/dagRuns',
+              data=body, headers=headers, method='POST'
+          )
+          with urllib.request.urlopen(req) as r:
+              d = json.loads(r.read())
+          print(d['dag_run_id'])
+          ")
+
+          echo "sales_pipeline run_id: $RUN_ID"
+          echo "SALES_RUN_ID=$RUN_ID" >> $GITHUB_ENV
+
+      - name: Poll sales_pipeline until complete
+        env:
+          AF_USER: ${{ secrets.AIRFLOW_ADMIN_USER || 'admin' }}
+          AF_PASS: ${{ secrets.AIRFLOW_ADMIN_PASSWORD || 'admin' }}
+        run: |
+          AF_USER="${AF_USER:-admin}"
+          AF_PASS="${AF_PASS:-admin}"
+          RUN_ID="$SALES_RUN_ID"
+
+          python3 - << PYEOF
+          import urllib.request, json, base64, time, sys
+
+          creds  = base64.b64encode(b"${AF_USER}:${AF_PASS}").decode()
+          headers = {"Authorization": f"Basic {creds}"}
+          url = f"http://localhost:8080/api/v1/dags/sales_pipeline/dagRuns/{RUN_ID}"
+
+          print(f"Polling sales_pipeline  run_id={RUN_ID}")
+          for attempt in range(60):
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req) as r:
+                  state = json.loads(r.read())["state"]
+              print(f"  attempt {attempt+1}/60 — state={state}")
+              if state == "success":
+                  print("✅  sales_pipeline succeeded")
+                  sys.exit(0)
+              if state in ("failed", "upstream_failed"):
+                  print(f"❌  sales_pipeline entered state: {state}")
+                  sys.exit(1)
+              time.sleep(10)
+
+          print("❌  Timed out waiting for sales_pipeline")
+          sys.exit(1)
+          PYEOF
+
+      # ── Step 7: Trigger and wait for data_flow_validation ────────────────
+      - name: Trigger data_flow_validation DAG
+        env:
+          AF_USER: ${{ secrets.AIRFLOW_ADMIN_USER || 'admin' }}
+          AF_PASS: ${{ secrets.AIRFLOW_ADMIN_PASSWORD || 'admin' }}
+        run: |
+          AF_USER="${AF_USER:-admin}"
+          AF_PASS="${AF_PASS:-admin}"
+
+          RUN_ID=$(python3 -c "
+          import urllib.request, json, base64
+
+          creds = base64.b64encode(b'${AF_USER}:${AF_PASS}').decode()
+          headers = {
+              'Content-Type': 'application/json',
+              'Authorization': f'Basic {creds}'
+          }
+          body = json.dumps({'conf': {}}).encode()
+          req = urllib.request.Request(
+              'http://localhost:8080/api/v1/dags/data_flow_validation/dagRuns',
+              data=body, headers=headers, method='POST'
+          )
+          with urllib.request.urlopen(req) as r:
+              d = json.loads(r.read())
+          print(d['dag_run_id'])
+          ")
+
+          echo "data_flow_validation run_id: $RUN_ID"
+          echo "VALIDATION_RUN_ID=$RUN_ID" >> $GITHUB_ENV
+
+      - name: Poll data_flow_validation until complete
+        env:
+          AF_USER: ${{ secrets.AIRFLOW_ADMIN_USER || 'admin' }}
+          AF_PASS: ${{ secrets.AIRFLOW_ADMIN_PASSWORD || 'admin' }}
+        run: |
+          AF_USER="${AF_USER:-admin}"
+          AF_PASS="${AF_PASS:-admin}"
+          RUN_ID="$VALIDATION_RUN_ID"
+
+          python3 - << PYEOF
+          import urllib.request, json, base64, time, sys
+
+          creds   = base64.b64encode(b"${AF_USER}:${AF_PASS}").decode()
+          headers = {"Authorization": f"Basic {creds}"}
+          url = f"http://localhost:8080/api/v1/dags/data_flow_validation/dagRuns/{RUN_ID}"
+
+          print(f"Polling data_flow_validation  run_id={RUN_ID}")
+          for attempt in range(60):
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req) as r:
+                  state = json.loads(r.read())["state"]
+              print(f"  attempt {attempt+1}/60 — state={state}")
+              if state == "success":
+                  print("✅  data_flow_validation succeeded")
+                  sys.exit(0)
+              if state in ("failed", "upstream_failed"):
+                  print(f"❌  data_flow_validation entered state: {state}")
+                  sys.exit(1)
+              time.sleep(10)
+
+          print("❌  Timed out waiting for data_flow_validation")
+          sys.exit(1)
+          PYEOF
+
+      # ── Step 8: End-to-end metrics report ────────────────────────────────
+      - name: Print end-to-end metrics report
+        if: success()
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║         MINI DATA PLATFORM — E2E METRICS REPORT         ║"
+          echo "╚══════════════════════════════════════════════════════════╝"
+
+          # MinIO file counts
+          RAW_COUNT=$(docker compose exec -T minio \
+            sh -c 'mc alias set local http://localhost:9000 minio minio123 >/dev/null 2>&1 && \
+                   mc ls local/sales-data/raw/ 2>/dev/null | wc -l' || echo "?")
+          ARCHIVE_COUNT=$(docker compose exec -T minio \
+            sh -c 'mc ls local/processed-data/archive/ 2>/dev/null | wc -l' || echo "?")
+
+          # PostgreSQL row counts — connect as admin for broadest access
+          PG_STATS=$(docker compose exec -T postgres \
+            psql -U admin -d salesdb -t -A -F'|' -c "
+              SELECT
+                (SELECT COUNT(*) FROM fact_sales),
+                (SELECT COUNT(*) FROM dim_customers),
+                (SELECT COUNT(*) FROM dim_products),
+                (SELECT COUNT(*) FROM mv_monthly_sales),
+                (SELECT COUNT(*) FROM pipeline_runs WHERE status='success'),
+                (SELECT COUNT(*) FROM pipeline_runs WHERE status='error')
+            " 2>/dev/null || echo "?|?|?|?|?|?")
+
+          IFS='|' read -r SALES CUSTOMERS PRODUCTS MV_ROWS SUCCESS_RUNS ERR_RUNS <<< "$PG_STATS"
+
+          echo ""
+          echo "  MinIO"
+          echo "  ├── raw/ files        : ${RAW_COUNT}"
+          echo "  └── archive/ files    : ${ARCHIVE_COUNT}"
+          echo ""
+          echo "  PostgreSQL"
+          echo "  ├── fact_sales rows   : ${SALES}"
+          echo "  ├── dim_customers     : ${CUSTOMERS}"
+          echo "  ├── dim_products      : ${PRODUCTS}"
+          echo "  └── mv_monthly_sales  : ${MV_ROWS}"
+          echo ""
+          echo "  Pipeline Runs"
+          echo "  ├── successful        : ${SUCCESS_RUNS}"
+          echo "  └── errors            : ${ERR_RUNS}"
+          echo ""
+          echo "  Airflow DAG Runs"
+          echo "  ├── sales_pipeline    : $SALES_RUN_ID"
+          echo "  └── data_flow_valid.  : $VALIDATION_RUN_ID"
+          echo ""
+          echo "  Commit     : ${{ github.sha }}"
+          echo "  Triggered  : ${{ github.actor }}"
+          echo "  Branch     : ${{ github.ref_name }}"
+          echo ""
+          echo "══════════════════════════════════════════════════════════"
+          echo "  ✅  ALL CHECKS PASSED — platform is healthy"
+          echo "══════════════════════════════════════════════════════════"
+
+      # ── Dump logs on any failure ──────────────────────────────────────────
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          echo "=== airflow-init ===" && docker compose logs airflow-init       || true
+          echo "=== airflow-webserver ===" && docker compose logs airflow-webserver || true
+          echo "=== airflow-scheduler ===" && docker compose logs airflow-scheduler  || true
+          echo "=== postgres ===" && docker compose logs postgres                || true
+          echo "=== minio ===" && docker compose logs minio                      || true
+          echo "=== data-generator ===" && docker compose logs data-generator    || true
+
+      # ── Step 9: Tear down (always runs) ──────────────────────────────────
+      - name: Tear down full environment
         if: always()
-        run: docker compose down -v
+        run: |
+          docker compose down -v --remove-orphans
+          echo "✅  Environment torn down"
