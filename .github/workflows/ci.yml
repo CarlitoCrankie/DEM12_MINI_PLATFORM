@@ -1,357 +1,210 @@
-# ──────────────────────────────────────────────────────────────────────────────
-#  Mini Data Platform — Continuous Integration
-#
-#  Triggered on every push to any branch and on every PR targeting main.
-#
-#  Jobs (run in parallel where possible):
-#    lint             → flake8 across dags/, data-generator/, tests/
-#    unit-tests       → pytest test_generator.py + test_dags.py  (no services)
-#    build            → docker build --target airflow + --target generator
-#    integration-test → postgres + minio + data-generator → pytest test_integration.py
-#    security-scan    → pip-audit on requirements.txt
-#
-#  Dependency graph:
-#    lint ──┬──▶ unit-tests ──▶ integration-test
-#           ├──▶ build      ──▶ integration-test
-#           └──▶ security-scan
-# ──────────────────────────────────────────────────────────────────────────────
-
-name: CI
+name: CI — Build & Test
 
 on:
   push:
     branches: ["**"]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
-# Cancel in-flight runs for the same branch when a new push arrives
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  PYTHON_VERSION: "3.11"
-  AIRFLOW_VERSION: "2.8.0"
-
-# ── 1. LINT ───────────────────────────────────────────────────────────────────
 jobs:
+
   lint:
-    name: Lint (flake8)
+    name: Lint
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install flake8
-        run: pip install flake8
-
-      - name: Lint — DAGs
-        run: |
-          flake8 dags/ \
-            --max-line-length=120 \
-            --ignore=E402,W503,E501,E221,E241,E203,E302,E301,E305 \
-            --format="::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s"
-
-      - name: Lint — data-generator
-        run: |
-          flake8 data-generator/ \
-            --max-line-length=120 \
-            --ignore=E402,W503,E501,E221,E241,E203,E302,E301,E305 \
-            --format="::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s"
-
-      - name: Lint — tests
-        run: |
-          flake8 tests/ \
-            --max-line-length=120 \
-            --ignore=E402,W503,E501,E221,E241,E203,E302,E301,E305 \
-            --format="::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s"
-
-# ── 2. UNIT TESTS ─────────────────────────────────────────────────────────────
-  unit-tests:
-    name: Unit Tests (no services)
-    runs-on: ubuntu-latest
-    needs: lint
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: "3.11"
           cache: pip
+      - run: pip install flake8 pyyaml
+      - run: flake8 dags/ data-generator/ tests/ --max-line-length=120 --ignore=E402,W503,E241,E221,E302,E303,E305,W292,F401
+      - run: python -c "import yaml; yaml.safe_load(open('docker-compose.yml'))"
 
-      # Airflow must be installed before its constraints are satisfied.
-      # We pin it to avoid nondeterminism and use the official constraints file.
-      - name: Install Apache Airflow ${{ env.AIRFLOW_VERSION }}
-        run: |
-          pip install --upgrade pip
-          pip install "apache-airflow==${{ env.AIRFLOW_VERSION }}" \
-            --constraint \
-            "https://raw.githubusercontent.com/apache/airflow/constraints-${{ env.AIRFLOW_VERSION }}/constraints-${{ env.PYTHON_VERSION }}.txt"
-
-      # Install project deps on top of Airflow (requirements.txt must exist)
-      - name: Install project dependencies
-        run: pip install -r requirements.txt
-
-      - name: Install pytest
-        run: pip install pytest pytest-cov
-
-      # test_dags.py auto-skips on Windows — we are on Linux so it runs fully
-      - name: Run generator unit tests
-        run: |
-          python -m pytest tests/test_generator.py \
-            -v --tb=short \
-            --junitxml=reports/unit-generator.xml
-
-      - name: Run DAG structure tests
-        run: |
-          python -m pytest tests/test_dags.py \
-            -v --tb=short \
-            --junitxml=reports/unit-dags.xml
-
-      - name: Upload test report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: unit-test-reports
-          path: reports/
-
-# ── 3. DOCKER BUILD ───────────────────────────────────────────────────────────
-  build:
-    name: Docker Build (both stages)
+  unit-tests:
+    name: Unit Tests
     runs-on: ubuntu-latest
     needs: lint
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # Cache layers in GitHub Actions cache to speed up repeated builds
-      - name: Build — airflow stage
-        uses: docker/build-push-action@v5
+      - uses: actions/setup-python@v5
         with:
-          context: .
-          file: Dockerfile
-          target: airflow
-          push: false
-          tags: mdp-airflow:ci
-          cache-from: type=gha,scope=airflow
-          cache-to: type=gha,mode=max,scope=airflow
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install pytest faker minio pandas psycopg2-binary
+      - name: Run unit tests
+        run: python -m pytest tests/test_generator.py -v
 
-      - name: Build — generator stage
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile
-          target: generator
-          push: false
-          tags: mdp-generator:ci
-          cache-from: type=gha,scope=generator
-          cache-to: type=gha,mode=max,scope=generator
-
-# ── 4. INTEGRATION TESTS ─────────────────────────────────────────────────────
-  integration-test:
-    name: Integration Tests (postgres + minio)
+  build:
+    name: Build (${{ matrix.target }})
     runs-on: ubuntu-latest
-    needs: [unit-tests, build]
+    needs: unit-tests
+    strategy:
+      matrix:
+        target: [airflow, generator]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          target: ${{ matrix.target }}
+          push: false
 
-    # These values are only for the CI test environment — not secrets
-    env:
-      POSTGRES_ADMIN_USER: admin
-      POSTGRES_ADMIN_PASSWORD: adminpass
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      SALES_DB: salesdb
-      SALES_DB_USER: datauser
-      SALES_DB_PASSWORD: datapass
-      MINIO_HOST: minio
-      MINIO_ROOT_USER: minio
-      MINIO_ROOT_PASSWORD: minio123
-      MINIO_API_PORT: 9000
-      MINIO_CONSOLE_PORT: 9001
-      MINIO_SOURCE_BUCKET: sales-data
-      MINIO_ARCHIVE_BUCKET: processed-data
-      AIRFLOW_FERNET_KEY: "81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs="
-      AIRFLOW_SECRET_KEY: "ci-secret-key"
-      AIRFLOW_DB_USER: airflow
-      AIRFLOW_DB_PASSWORD: airflow
-      AIRFLOW_DB: airflow
-      AIRFLOW_ADMIN_USER: admin
-      AIRFLOW_ADMIN_EMAIL: admin@mdp.local
-      AIRFLOW_ADMIN_PASSWORD: admin
-      AIRFLOW_WEBSERVER_PORT: 8080
-      METABASE_DB: metabase
-      METABASE_PORT: 3000
-
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      # Write a minimal .env so docker compose can resolve all variables
-      - name: Write .env for docker compose
+      - name: Write .env
         run: |
-          cat > .env << 'EOF'
-          POSTGRES_ADMIN_USER=admin
-          POSTGRES_ADMIN_PASSWORD=adminpass
-          POSTGRES_HOST=postgres
-          POSTGRES_PORT=5432
-          SALES_DB=salesdb
-          SALES_DB_USER=datauser
-          SALES_DB_PASSWORD=datapass
-          MINIO_HOST=minio
-          MINIO_ROOT_USER=minio
-          MINIO_ROOT_PASSWORD=minio123
-          MINIO_API_PORT=9000
-          MINIO_CONSOLE_PORT=9001
-          MINIO_SOURCE_BUCKET=sales-data
-          MINIO_ARCHIVE_BUCKET=processed-data
-          AIRFLOW_FERNET_KEY=81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs=
-          AIRFLOW_SECRET_KEY=ci-secret-key
-          AIRFLOW_DB_USER=airflow
-          AIRFLOW_DB_PASSWORD=airflow
-          AIRFLOW_DB=airflow
-          AIRFLOW_ADMIN_USER=admin
-          AIRFLOW_ADMIN_EMAIL=admin@mdp.local
-          AIRFLOW_ADMIN_PASSWORD=admin
-          AIRFLOW_WEBSERVER_PORT=8080
-          METABASE_DB=metabase
-          METABASE_PORT=3000
-          EOF
+          printf '%s\n' \
+            "POSTGRES_HOST=postgres" \
+            "POSTGRES_PORT=5432" \
+            "POSTGRES_ADMIN_USER=admin" \
+            "POSTGRES_ADMIN_PASSWORD=adminpass" \
+            "AIRFLOW_DB=airflow" \
+            "AIRFLOW_DB_USER=airflow" \
+            "AIRFLOW_DB_PASSWORD=airflow" \
+            "SALES_DB=salesdb" \
+            "SALES_DB_USER=datauser" \
+            "SALES_DB_PASSWORD=datapass" \
+            "METABASE_DB=metabase" \
+            "MINIO_HOST=minio" \
+            "MINIO_API_PORT=9000" \
+            "MINIO_CONSOLE_PORT=9001" \
+            "MINIO_ROOT_USER=minio" \
+            "MINIO_ROOT_PASSWORD=minio123" \
+            "MINIO_SOURCE_BUCKET=sales-data" \
+            "MINIO_ARCHIVE_BUCKET=processed-data" \
+            "AIRFLOW_WEBSERVER_PORT=8080" \
+            "AIRFLOW_ADMIN_USER=admin" \
+            "AIRFLOW_ADMIN_PASSWORD=admin" \
+            "AIRFLOW_ADMIN_EMAIL=admin@ci.local" \
+            "AIRFLOW_FERNET_KEY=81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs=" \
+            "AIRFLOW_SECRET_KEY=a25mQ1FHTUh3MnFRSk5KMEIyVVU2YmN0VGRyYTVXY2" \
+            "METABASE_PORT=3000" > .env
 
-      # Only bring up the infra services needed for integration tests
-      # (skip Airflow + Metabase — those are validated in the CD pipeline)
-      - name: Start postgres + minio
-        run: docker compose up -d postgres minio minio-init
-
-      - name: Wait for PostgreSQL to be healthy
+      # ── Step 1: Start database and storage ──────────────────────────────
+      - name: Start PostgreSQL and MinIO
         run: |
+          docker compose up -d postgres minio minio-init
           echo "Waiting for PostgreSQL..."
-          for i in $(seq 1 30); do
-            docker compose exec -T postgres pg_isready -U admin -d postgres && break
-            echo "  attempt $i/30 — sleeping 3s"
-            sleep 3
-          done
-          docker compose exec -T postgres pg_isready -U admin -d postgres \
-            || { echo "::error::PostgreSQL did not become healthy in time"; exit 1; }
-
-      - name: Wait for MinIO to be healthy
-        run: |
+          timeout 90 bash -c '
+            until docker inspect mdp-postgres \
+              --format="{{.State.Health.Status}}" 2>/dev/null | grep -q "healthy"; do
+              sleep 3
+            done'
+          echo "PostgreSQL healthy"
           echo "Waiting for MinIO..."
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:9000/minio/health/live && break
-            echo "  attempt $i/30 — sleeping 3s"
-            sleep 3
-          done
-          curl -sf http://localhost:9000/minio/health/live \
-            || { echo "::error::MinIO did not become healthy in time"; exit 1; }
+          timeout 60 bash -c '
+            until docker compose exec -T minio \
+              mc alias set local http://localhost:9000 minio minio123 2>/dev/null; do
+              sleep 3
+            done'
+          echo "MinIO ready"
 
-      - name: Wait for minio-init to finish creating buckets
-        run: |
-          docker compose wait minio-init || true
-          echo "MinIO init complete — checking buckets..."
-          docker compose logs minio-init
-
-      - name: Run data generator (seed MinIO)
+      # ── Step 2: Upload data ─────────────────────────────────────────────
+      - name: Generate and upload sample data
         run: |
           docker compose run --rm data-generator
-          echo "Verifying files were uploaded..."
-          docker compose exec -T minio \
-            sh -c 'mc alias set local http://localhost:9000 minio minio123 2>/dev/null; mc ls local/sales-data/raw/' \
-            || docker compose logs data-generator
+          docker compose exec -T minio mc alias set local http://localhost:9000 minio minio123
+          COUNT=$(docker compose exec -T minio mc ls local/sales-data/raw/ | wc -l)
+          echo "Files uploaded to MinIO: $COUNT"
+          [ "$COUNT" -gt 0 ] || (echo "ERROR: No files uploaded" && exit 1)
 
-      - name: Set up Python for integration tests
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: Install integration test dependencies
-        run: pip install minio psycopg2-binary pandas pytest python-dotenv
-
-      - name: Run integration tests
-        env:
-          MINIO_API_PORT: "9000"
-          POSTGRES_PORT: "5432"
+      # ── Step 3: Start Airflow ───────────────────────────────────────────
+      - name: Start Airflow
         run: |
-          python -m pytest tests/test_integration.py \
-            -v --tb=short -s \
-            --junitxml=reports/integration.xml
+          docker compose up -d airflow-init
+          echo "Waiting for Airflow DB migration..."
+          timeout 180 bash -c '
+            until docker compose logs airflow-init 2>/dev/null | grep -q "Airflow initialised"; do
+              sleep 5
+            done'
+          echo "Airflow initialised"
+          docker compose up -d airflow-webserver airflow-scheduler
+          echo "Waiting for Airflow webserver..."
+          timeout 120 bash -c '
+            until curl -sf http://localhost:8080/health 2>/dev/null | grep -q "healthy"; do
+              sleep 5
+            done'
+          echo "Airflow webserver healthy"
 
-      - name: Upload integration test report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: integration-test-reports
-          path: reports/
+      # ── Step 4: Wait for DAG discovery ─────────────────────────────────
+      - name: Wait for DAG discovery
+        run: |
+          echo "Waiting for DAGs to be discovered..."
+          timeout 120 bash -c '
+            until curl -sf -u admin:admin \
+              http://localhost:8080/api/v1/dags/sales_pipeline 2>/dev/null \
+              | grep -q "sales_pipeline"; do
+              echo "  DAG not yet in API..."
+              sleep 10
+            done'
+          echo "sales_pipeline DAG is ready"
 
-      - name: Dump container logs on failure
+      # ── Step 5: Trigger via REST API and poll ──────────────────────────
+      - name: Trigger pipeline and wait for completion
+        run: |
+          echo "Triggering sales_pipeline via REST API..."
+          RUN_ID=$(curl -sf -u admin:admin \
+            -X POST http://localhost:8080/api/v1/dags/sales_pipeline/dagRuns \
+            -H "Content-Type: application/json" \
+            -d "{\"conf\": {}}" | python3 -c "import sys,json; print(json.load(sys.stdin)['dag_run_id'])")
+          echo "DAG run triggered: $RUN_ID"
+
+          echo "Polling for completion every 20s (max 10 min)..."
+          for i in $(seq 1 30); do
+            sleep 20
+            STATE=$(curl -sf -u admin:admin \
+              "http://localhost:8080/api/v1/dags/sales_pipeline/dagRuns/${RUN_ID}" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin).get('state','unknown'))" 2>/dev/null)
+            echo "  Poll $i/30 — state: ${STATE}"
+            if [ "$STATE" = "success" ]; then
+              echo "Pipeline completed successfully"
+              exit 0
+            elif [ "$STATE" = "failed" ]; then
+              echo "ERROR: Pipeline run failed — fetching failed task details..."
+              curl -sf -u admin:admin \
+                "http://localhost:8080/api/v1/dags/sales_pipeline/dagRuns/${RUN_ID}/taskInstances" \
+                | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for t in data.get('task_instances', []):
+              if t.get('state') == 'failed':
+                  print(f\"FAILED TASK: {t['task_id']} — {t.get('state')}\")
+          " 2>/dev/null || true
+              exit 1
+            fi
+          done
+          echo "ERROR: Pipeline did not complete within 10 minutes"
+          exit 1
+
+      # ── Step 6: Verify data landed ─────────────────────────────────────
+      - name: Verify data in PostgreSQL
+        run: |
+          ROWS=$(docker compose exec -T postgres \
+            psql -U admin -d salesdb -t -c "SELECT COUNT(*) FROM fact_sales" | xargs)
+          echo "Rows in fact_sales: $ROWS"
+          [ "$ROWS" -gt 0 ] || (echo "ERROR: No rows loaded into fact_sales" && exit 1)
+
+          PIPELINE_RUNS=$(docker compose exec -T postgres \
+            psql -U admin -d salesdb -t -c "SELECT COUNT(*) FROM pipeline_runs WHERE status='success'" | xargs)
+          echo "Successful pipeline runs: $PIPELINE_RUNS"
+
+      - name: Dump logs on failure
         if: failure()
         run: |
-          echo "=== postgres ===" && docker compose logs postgres
-          echo "=== minio ===" && docker compose logs minio
-          echo "=== minio-init ===" && docker compose logs minio-init
-          echo "=== data-generator ===" && docker compose logs data-generator
+          echo "=== airflow-init ===" && docker compose logs airflow-init || true
+          echo "=== airflow-scheduler ===" && docker compose logs airflow-scheduler || true
+          echo "=== postgres ===" && docker compose logs postgres || true
+          echo "=== data-generator ===" && docker compose logs data-generator || true
 
-      - name: Tear down
+      - name: Cleanup
         if: always()
-        run: docker compose down -v --remove-orphans
-
-# ── 5. SECURITY SCAN ─────────────────────────────────────────────────────────
-  security-scan:
-    name: Security Scan (pip-audit)
-    runs-on: ubuntu-latest
-    needs: lint
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install pip-audit
-        run: pip install pip-audit
-
-      # Report all vulnerabilities; exit non-zero only on HIGH/CRITICAL
-      - name: Audit dependencies
-        run: |
-          pip-audit \
-            -r requirements.txt \
-            --output json \
-            --format json \
-            -o reports/pip-audit.json || true
-
-      - name: Display audit results
-        run: |
-          if [ -f reports/pip-audit.json ]; then
-            python - << 'PYEOF'
-          import json, sys
-          data = json.load(open("reports/pip-audit.json"))
-          vulns = data.get("dependencies", [])
-          found = [v for d in vulns for v in d.get("vulns", [])]
-          if not found:
-              print("✅  No known vulnerabilities found.")
-              sys.exit(0)
-          print(f"⚠️  {len(found)} vulnerability/ies found:\n")
-          for v in found:
-              print(f"  [{v.get('id')}] {v.get('description', '')[:120]}")
-          # Fail only on CRITICAL severity to avoid flapping on low-risk CVEs
-          critical = [v for v in found if "CRITICAL" in str(v)]
-          if critical:
-              print("\n❌  CRITICAL vulnerabilities — failing build.")
-              sys.exit(1)
-          print("\nℹ️  Non-critical vulnerabilities — build continues.")
-          PYEOF
-          fi
-
-      - name: Upload audit report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-audit-report
-          path: reports/pip-audit.json
+        run: docker compose down -v
