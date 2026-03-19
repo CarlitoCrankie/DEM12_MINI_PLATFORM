@@ -79,19 +79,11 @@ with DAG(
     @task
     def list_new_files() -> list:
         mc = get_minio()
-        try:
-            with get_pg() as conn, conn.cursor() as cur:
-                cur.execute("SELECT source_file FROM pipeline_runs WHERE status = 'success'")
-                processed = {row[0] for row in cur.fetchall()}
-        except Exception:
-            processed = set()
-
-        all_files = [
+        new_files = [
             obj.object_name
             for obj in mc.list_objects(SOURCE_BUCKET, prefix="raw/", recursive=True)
             if obj.object_name.endswith(".csv")
         ]
-        new_files = [f for f in all_files if f not in processed]
         log.info("%d new file(s) found.", len(new_files))
         return new_files
 
