@@ -111,6 +111,16 @@ jobs:
             done'
           echo "MinIO ready"
 
+      # ── Step 1b: Fix database permissions ──────────────────────────────
+      - name: Fix database permissions
+        run: |
+          docker compose exec -T postgres psql -U admin -d salesdb << 'SQL'
+            GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO datauser;
+            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO datauser;
+            ALTER MATERIALIZED VIEW IF EXISTS mv_monthly_sales OWNER TO datauser;
+          SQL
+          echo "Permissions fixed"
+
       # ── Step 2: Upload data ─────────────────────────────────────────────
       - name: Generate and upload sample data
         run: |

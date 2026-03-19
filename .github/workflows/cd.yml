@@ -103,6 +103,15 @@ jobs:
             done'
           echo "Airflow ready"
 
+      - name: Fix database permissions
+        run: |
+          docker compose exec -T postgres psql -U admin -d salesdb << 'SQL'
+            GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO datauser;
+            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO datauser;
+            ALTER MATERIALIZED VIEW IF EXISTS mv_monthly_sales OWNER TO datauser;
+          SQL
+          echo "Permissions fixed"
+
       # ── Seed data ───────────────────────────────────────────────────────
       - name: Generate and upload sample data
         run: docker compose run --rm data-generator
